@@ -1,0 +1,59 @@
+
+name: LibreToon Web Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "index.html"
+      - ".github/workflows/build.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  web-build:
+    name: Build LibreToon WebAssembly
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk
+        uses: cargo-binstall/cargo-binstall@main
+
+      - name: Install Trunk binary
+        run: cargo binstall trunk --no-confirm
+
+      - name: Check WebAssembly target
+        run: rustup target list --installed
+
+      - name: Build website
+        run: trunk build --release
+
+      - name: Verify website output
+        run: |
+          test -f dist/index.html
+          find dist -maxdepth 2 -type f
+
+      - name: Upload web build
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibreToon-Web-Build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

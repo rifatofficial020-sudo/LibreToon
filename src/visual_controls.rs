@@ -325,14 +325,17 @@ impl Editor {
             return;
         };
         let center = crate::vector::control_bounds(mark).center();
-        let reference = &self.doc.layers[l].frames[0];
-        let matrix = reference
-            .get(m)
+        // Frame-local marks have no stable correspondence by index.
+        let track = mark.style.track;
+        let matrix = self.doc.layers[l].frames[0]
+            .iter()
+            .find(|reference| track != 0 && reference.style.track == track)
             .map_or([1., 0., 0., 1.], |a| crate::animation::delta(a, mark));
         let sx = Vec2::new(matrix[0], matrix[1]).length().max(0.001);
         let sy = (matrix[0] * matrix[3] - matrix[1] * matrix[2]) / sx;
         let angle = matrix[1].atan2(matrix[0]).to_degrees();
         let mut values = [center.x, center.y, angle, sx * 100., sy * 100.];
+        let mut edited = [false; 5];
         egui::Grid::new("motion-transform")
             .num_columns(2)
             .show(ui, |ui| {
@@ -341,19 +344,33 @@ impl Editor {
                     .enumerate()
                 {
                     ui.label(*label);
-                    ui.add(
-                        egui::DragValue::new(&mut values[i])
-                            .range(if i >= 3 { 1. ..=10000. } else { -1e6..=1e6 })
-                            .speed(0.5),
-                    );
+                    edited[i] = ui
+                        .add(
+                            egui::DragValue::new(&mut values[i])
+                                .range(if i >= 3 { 1. ..=10000. } else { -1e6..=1e6 })
+                                .clamp_existing_to_range(false)
+                                .speed(0.5),
+                        )
+                        .changed();
                     ui.end_row();
                 }
             });
-        if values != [center.x, center.y, angle, sx * 100., sy * 100.] {
+        if edited.iter().any(|&changed| changed) {
             self.checkpoint();
             self.autokey_motion(&ids);
             let translation = Vec2::new(values[0] - center.x, values[1] - center.y);
-            let scale = Vec2::new(values[3] / (sx * 100.), values[4] / (sy * 100.).max(0.01));
+            let scale = Vec2::new(
+                if edited[3] {
+                    values[3] / (sx * 100.)
+                } else {
+                    1.
+                },
+                if edited[4] && sy.abs() >= 0.0001 {
+                    values[4] / (sy * 100.)
+                } else {
+                    1.
+                },
+            );
             let rotation = (values[2] - angle).to_radians();
             for &(l, m) in &ids {
                 if self.doc.layers[l].options.locked {
@@ -370,24 +387,7 @@ impl Editor {
         }
     }
     pub fn sample_apply_at(&mut self, ids: &[(usize, usize)], p: Pos2, tolerance: f32) {
-        let source = self
-            .doc
-            .layers
-            .iter()
-            .rev()
-            .filter(|l| l.visible)
-            .find_map(|l| {
-                crate::animation::marks(l, self.frame)
-                    .iter()
-                    .rev()
-                    .find(|m| {
-                        crate::vector::contains_fill(m, p)
-                            && !crate::canvas::stroke_hit(m, p, tolerance)
-                    })
-                    .cloned()
-            });
-        self.sample_at(p, tolerance);
-        if let Some(source) = source {
+        if let Some(source) = self.sample_at(p, tolerance, None) {
             self.feature.gradient_on = source.style.gradient.is_some();
             if let Some(g) = &source.style.gradient {
                 self.feature.gradient = g.clone();

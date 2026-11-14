@@ -276,6 +276,7 @@ pub struct State {
         SharedVec<crate::features::Symbol>,
         SharedVec<crate::rig::Bone>,
         SharedVec<crate::rig::Binding>,
+        crate::rig::CharacterTurns,
         usize,
         u64,
         Rect,
@@ -549,7 +550,7 @@ impl Editor {
         self.activate_tool(crate::canvas::Tool::Transform);
     }
     fn folder_bounds(&mut self, id: u64) -> Option<Rect> {
-        if let Some((layers, folders, symbols, bones, bindings, frame, folder, bounds)) =
+        if let Some((layers, folders, symbols, bones, bindings, turns, frame, folder, bounds)) =
             &self.folder_groups.bounds
         {
             if layers.identity() == self.doc.layers.identity()
@@ -557,6 +558,7 @@ impl Editor {
                 && symbols.identity() == self.doc.extras.symbols.identity()
                 && bones.identity() == self.doc.extras.rig.bones.identity()
                 && bindings.identity() == self.doc.extras.rig.bindings.identity()
+                && turns.identity() == self.doc.extras.rig.character_turns.identity()
                 && *frame == self.frame
                 && *folder == id
             {
@@ -582,6 +584,7 @@ impl Editor {
             self.doc.extras.symbols.clone(),
             self.doc.extras.rig.bones.clone(),
             self.doc.extras.rig.bindings.clone(),
+            self.doc.extras.rig.character_turns.clone(),
             self.frame,
             id,
             bounds,
@@ -1271,6 +1274,7 @@ mod tests {
             name: format!("Folder {id}"),
             parent,
             collapsed: false,
+            timeline_slot: None,
             transform: Default::default(),
             range: None,
             source_shift: 0,

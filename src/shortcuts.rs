@@ -18,6 +18,23 @@ pub enum Action {
     Forward,
     Backward,
     Back,
+    ShiftTrace,
+    ExposureSheet,
+    BatchTransform,
+    AnimationManager,
+    ColorPanel,
+    PostProcessing,
+    Lights,
+    Onion,
+    LayerObjects,
+    CommandHelper,
+    PreparePreview,
+    CreateClip,
+    KeyAdd,
+    BlankKey,
+    ExtendExposure,
+    ShortenExposure,
+    DeleteKey,
 }
 // Append new entries: preferences from older versions keep their action indices.
 pub const ACTIONS: &[Action] = &[
@@ -36,6 +53,23 @@ pub const ACTIONS: &[Action] = &[
     Action::Forward,
     Action::Backward,
     Action::Back,
+    Action::ShiftTrace,
+    Action::ExposureSheet,
+    Action::BatchTransform,
+    Action::AnimationManager,
+    Action::ColorPanel,
+    Action::PostProcessing,
+    Action::Lights,
+    Action::Onion,
+    Action::LayerObjects,
+    Action::CommandHelper,
+    Action::PreparePreview,
+    Action::CreateClip,
+    Action::KeyAdd,
+    Action::BlankKey,
+    Action::ExtendExposure,
+    Action::ShortenExposure,
+    Action::DeleteKey,
 ];
 impl Action {
     pub fn name(self) -> &'static str {
@@ -55,6 +89,23 @@ impl Action {
             Self::Forward => "Traer adelante",
             Self::Backward => "Enviar atrás",
             Self::Back => "Enviar al fondo",
+            Self::ShiftTrace => "Shift & Trace",
+            Self::ExposureSheet => "Exposure sheet",
+            Self::BatchTransform => "Transform keyframes",
+            Self::AnimationManager => "Animation Manager",
+            Self::ColorPanel => "Color palettes",
+            Self::PostProcessing => "Show / Hide Post-Processing",
+            Self::Lights => "Show / Hide Lights",
+            Self::Onion => "Papel cebolla",
+            Self::LayerObjects => "Layer objects",
+            Self::CommandHelper => "COMMAND HELPER",
+            Self::PreparePreview => "Prepare preview",
+            Self::CreateClip => "Create Animation Clip…",
+            Self::KeyAdd => "Insert keyframe",
+            Self::BlankKey => "Insert blank keyframe",
+            Self::ExtendExposure => "Ampliar duración de fotograma",
+            Self::ShortenExposure => "Reducir duración de fotograma",
+            Self::DeleteKey => "Eliminar fotograma clave",
         }
     }
     pub fn icon(self) -> Icon {
@@ -74,6 +125,23 @@ impl Action {
             Self::Forward => Icon::StepFront,
             Self::Backward => Icon::StepBack,
             Self::Back => Icon::SendBack,
+            Self::ShiftTrace => Icon::Reference,
+            Self::ExposureSheet => Icon::Layers,
+            Self::BatchTransform => Icon::Transform,
+            Self::AnimationManager => Icon::Film,
+            Self::ColorPanel => Icon::Eyedropper,
+            Self::PostProcessing => Icon::Fx,
+            Self::Lights => Icon::Bulb,
+            Self::Onion => Icon::Onion,
+            Self::LayerObjects => Icon::Layers,
+            Self::CommandHelper => Icon::CommandHelper,
+            Self::PreparePreview => Icon::Play,
+            Self::CreateClip => Icon::Film,
+            Self::KeyAdd => Icon::KeyAdd,
+            Self::BlankKey => Icon::BlankKeyAdd,
+            Self::ExtendExposure => Icon::FrameExtend,
+            Self::ShortenExposure => Icon::FrameShorten,
+            Self::DeleteKey => Icon::KeyRemove,
         }
     }
 }
@@ -217,8 +285,42 @@ impl Editor {
             Action::Stage => self.studio.stage_only = !self.studio.stage_only,
             Action::Scenes => self.animation.scenes_open = !self.animation.scenes_open,
             Action::ImportMedia => self.import_media(ctx),
-            Action::Properties => self.feature.library = false,
-            Action::Library => self.feature.library = true,
+            Action::Properties | Action::Library => {
+                self.feature.library = action == Action::Library;
+                self.clips.open = false;
+                self.studio.palette.open = false;
+            }
+            Action::ShiftTrace => self.toggle_shift_trace(),
+            Action::ExposureSheet => self.animation.exposure_sheet ^= true,
+            Action::BatchTransform => self.open_batch_transform(),
+            Action::AnimationManager => {
+                self.clips.open = true;
+                self.studio.palette.open = false;
+            }
+            Action::ColorPanel => self.studio.palette.open = true,
+            Action::PostProcessing => self.post.hidden ^= true,
+            Action::Lights => self.post.hide_lights ^= true,
+            Action::Onion => self.onion ^= true,
+            Action::LayerObjects => self.studio.layer_objects_open ^= true,
+            Action::CommandHelper => self.studio.command_helper ^= true,
+            Action::PreparePreview => self.prepare_preview(None),
+            Action::CreateClip => self.begin_animation_clip(),
+            Action::KeyAdd
+            | Action::BlankKey
+            | Action::ExtendExposure
+            | Action::ShortenExposure
+            | Action::DeleteKey => {
+                if crate::frame_workflow::editable(&self.doc.layers[self.layer]) {
+                    let operation = match action {
+                        Action::KeyAdd => 0,
+                        Action::BlankKey => 1,
+                        Action::ExtendExposure => 2,
+                        Action::ShortenExposure => 3,
+                        _ => 4,
+                    };
+                    self.timeline_edit(operation);
+                }
+            }
             Action::AddCamera => self.add_camera(),
             Action::CameraKey => {
                 if let Some(id) = crate::depth::camera(&self.doc, self.frame)

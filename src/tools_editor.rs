@@ -45,18 +45,21 @@ impl Editor {
         }
     }
     pub fn change_selected_style(&mut self, fill: bool, stroke: bool, width: bool, profile: bool) {
-        let ids = self.canvas.selected.clone();
-        if ids.is_empty() {
+        if self.canvas.selected.is_empty() {
             return;
         }
         if !self.style_transaction {
+            let mut state = std::mem::take(&mut self.canvas);
             self.checkpoint();
+            self.materialize_fragments(&mut state);
+            self.canvas = state;
             self.style_transaction = true;
         }
-        for &(l, m) in &ids {
+        for &(l, m) in &self.canvas.selected {
             let mark = &mut self.doc.layers[l].frames[self.frame][m];
             if fill && mark.fill.is_some() {
                 mark.fill = Some(self.fill_color.to_array());
+                mark.style.palette_fill = None;
                 mark.style.gradient = None;
                 self.feature.gradient_on = false;
                 mark.style.shade = 0;
@@ -64,6 +67,7 @@ impl Editor {
             }
             if stroke && mark.stroke {
                 mark.color = self.color.to_array();
+                mark.style.palette_stroke = None;
             }
             if width && mark.stroke {
                 mark.width = self.width;
@@ -72,7 +76,6 @@ impl Editor {
                 mark.width_profile = self.width_profile.clone();
             }
         }
-        self.canvas.selected = ids;
         self.recover();
     }
     pub fn selection_properties_ui(&mut self, ui: &mut egui::Ui) {
@@ -128,56 +131,37 @@ impl Editor {
             return;
         }
         let cutter = crate::editing::area(points);
-        let mut selected = vec![];
-        let mut edits = vec![];
-        let mut changed = false;
-        for (l, layer) in self
-            .doc
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.visible && !l.options.locked && !l.options.raster)
+        self.select_fragments(state, add, |mark| crate::editing::split_area(mark, &cutter));
+    }
+
+    pub(crate) fn select_fragments(
+        &self,
+        state: &mut Canvas,
+        add: bool,
+        split: impl Fn(&Mark) -> (Vec<Mark>, Vec<Mark>),
+    ) {
+        if !add {
+            state.clear_selection();
+        }
+        for (l, layer) in
+            self.doc.layers.iter().enumerate().filter(|(_, layer)| {
+                layer.visible && !layer.options.locked && !layer.options.raster
+            })
         {
-            let mut marks = vec![];
-            let mut layer_changed = false;
             for (m, mark) in layer.frames[self.frame].iter().enumerate() {
-                let (outside, inside) = crate::editing::split_area(mark, &cutter);
-                let previous = add && state.selected.contains(&(l, m));
-                if inside.is_empty() {
-                    if previous {
-                        selected.push((l, marks.len()));
-                    }
-                    marks.push(mark.clone());
-                } else if outside.is_empty() {
-                    selected.push((l, marks.len()));
-                    marks.push(mark.clone());
-                } else {
-                    layer_changed = true;
-                    changed = true;
-                    for part in outside {
-                        if previous {
-                            selected.push((l, marks.len()));
-                        }
-                        marks.push(part);
-                    }
-                    for part in inside {
-                        selected.push((l, marks.len()));
-                        marks.push(part);
+                let id = (l, m);
+                if state.selected.contains(&id) {
+                    continue;
+                }
+                let (outside, inside) = split(mark);
+                if !inside.is_empty() {
+                    state.selected.push(id);
+                    if !outside.is_empty() {
+                        state.partial.insert(id, (outside, inside));
                     }
                 }
             }
-            if layer_changed {
-                edits.push((l, marks));
-            }
         }
-        if changed {
-            self.checkpoint();
-            for (l, marks) in edits {
-                self.doc.layers[l].frames[self.frame] = marks.into();
-            }
-            self.recover();
-        }
-        state.selected = selected;
         state.pivot = None;
     }
     pub fn erase_segment(&mut self, a: Pos2, b: Pos2) -> bool {
@@ -206,19 +190,50 @@ impl Editor {
         }
         changed
     }
-    pub fn sample_at(&mut self, point: Pos2, tolerance: f32) {
-        for layer in self.doc.layers.iter().rev().filter(|l| l.visible) {
-            for mark in layer.frames[self.frame].iter().rev() {
+    pub(crate) fn sample_at(
+        &mut self,
+        point: Pos2,
+        tolerance: f32,
+        picker: Option<bool>,
+    ) -> Option<Mark> {
+        for (layer_index, layer) in self.doc.layers.iter().enumerate().rev().filter(|(_, l)| {
+            l.visible && crate::folder_groups::layer_active(&self.doc, l, self.frame)
+        }) {
+            let point = self.depth_point(point, self.layer, layer_index);
+            let marks = crate::animation::marks(layer, self.frame);
+            for mark in marks
+                .iter()
+                .rev()
+                .filter(|mark| crate::features::object_visible(layer, mark, self.frame))
+            {
+                if mark.style.media_image.is_some() {
+                    if let Some([r, g, b, _]) = self.doc.extras.media.image_pixel(mark, point) {
+                        let color = Color32::from_rgb(r, g, b);
+                        if picker.is_none() {
+                            self.color = color;
+                            self.stroke_enabled = true;
+                        }
+                        self.apply_picker_color(color, picker.unwrap_or(true));
+                        return None;
+                    }
+                    continue;
+                }
                 let stroke = crate::canvas::stroke_hit(mark, point, tolerance);
                 if stroke {
                     let c = mark.color;
-                    self.color = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                    let color = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                    if let Some(fill) = picker {
+                        self.apply_picker_color(color, fill);
+                        return None;
+                    }
+                    self.color = color;
+                    self.fill_color = color;
                     self.stroke_enabled = true;
                     self.active_fill = false;
                     self.width = mark.width;
                     self.width_profile = mark.width_profile.clone();
                     self.width_preset = crate::width::Preset::Custom;
-                    return;
+                    return None;
                 }
                 if crate::vector::contains_fill(mark, point) {
                     let c = mark
@@ -226,13 +241,15 @@ impl Editor {
                         .gradient
                         .as_ref()
                         .map_or_else(|| mark.fill.unwrap(), |g| g.color(point));
-                    self.fill_color = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-                    self.fill_enabled = true;
-                    self.active_fill = true;
-                    return;
+                    self.apply_picker_color(
+                        Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]),
+                        picker.unwrap_or(true),
+                    );
+                    return picker.is_none().then(|| mark.clone());
                 }
             }
         }
+        None
     }
     pub fn wand_select(&mut self, state: &mut Canvas, point: Pos2, add: bool) {
         let found = self
@@ -457,26 +474,22 @@ impl Editor {
         self.feature.library = false;
         self.tool = tool;
     }
-    pub fn split_clicked_crossing(
-        &mut self,
-        state: &mut Canvas,
+    pub(crate) fn preview_stroke_segment(
+        &self,
         id: (usize, usize),
         point: Pos2,
-    ) -> (usize, usize) {
-        let marks = &self.doc.layers[id.0].frames[self.frame];
+    ) -> Option<(Vec<Mark>, Vec<Mark>)> {
+        let marks = crate::animation::marks(&self.doc.layers[id.0], self.frame);
         let mark = &marks[id.1];
-        if !mark.stroke {
-            return id;
-        }
         let others: Vec<Mark> = marks
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != id.1)
             .map(|(_, m)| m.clone())
             .collect();
-        let parts = crate::editing::crossing_parts(mark, &others);
+        let mut parts = crate::editing::crossing_parts(mark, &others);
         if parts.len() < 2 {
-            return id;
+            return None;
         }
         let closest = parts
             .iter()
@@ -485,22 +498,9 @@ impl Editor {
                 crate::canvas::axis_distance(a, point)
                     .total_cmp(&crate::canvas::axis_distance(b, point))
             })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let count = parts.len();
-        self.checkpoint();
-        let frame = &mut self.doc.layers[id.0].frames[self.frame];
-        frame.remove(id.1);
-        for (i, part) in parts.into_iter().enumerate() {
-            frame.insert(id.1 + i, part);
-        }
-        for (l, m) in &mut state.selected {
-            if *l == id.0 && *m > id.1 {
-                *m += count - 1;
-            }
-        }
-        self.recover();
-        (id.0, id.1 + closest)
+            .map(|(i, _)| i)?;
+        let selected = parts.remove(closest);
+        Some((parts, vec![selected]))
     }
     pub(crate) fn prepare_paint_key(&mut self, layer: usize, frame: usize) {
         if self.studio.prefs.auto_key_paint && !self.doc.layers[layer].key(frame) {
@@ -513,7 +513,7 @@ impl Editor {
     }
     pub fn commit_paint(&mut self, layer: usize, frame: usize, marks: Vec<Mark>) {
         if self.doc.layers[layer].options.mannequin.is_some()
-            || self.doc.layers[layer].options.adjustment.is_some()
+            || crate::post::is_adjustment(&self.doc.layers[layer])
         {
             return;
         }
@@ -526,10 +526,24 @@ impl Editor {
         self.doc.layers[layer].frames[frame] = composed.into();
     }
     pub fn select_connected_object(&self, state: &mut Canvas, seed: (usize, usize), add: bool) {
+        self.select_connected_marks(state, seed, add, false);
+    }
+
+    pub(crate) fn select_connected_strokes(&self, state: &mut Canvas, seed: (usize, usize)) {
+        self.select_connected_marks(state, seed, false, true);
+    }
+
+    fn select_connected_marks(
+        &self,
+        state: &mut Canvas,
+        seed: (usize, usize),
+        add: bool,
+        strokes_only: bool,
+    ) {
         use geo::{BooleanOps, Intersects};
         let marks = &self.doc.layers[seed.0].frames[self.frame];
         let ink = |mark: &Mark| {
-            let mut area = if mark.fill.is_some() {
+            let mut area = if !strokes_only && mark.fill.is_some() {
                 geo::MultiPolygon(vec![crate::vector::polygon(mark)])
             } else {
                 geo::MultiPolygon(vec![])
@@ -552,6 +566,12 @@ impl Editor {
                 .clone();
             for j in 0..marks.len() {
                 if visited[j]
+                    || (strokes_only && !marks[j].stroke)
+                    || !crate::features::object_visible(
+                        &self.doc.layers[seed.0],
+                        &marks[j],
+                        self.frame,
+                    )
                     || !bounds.intersects(
                         crate::vector::control_bounds(&marks[j]).expand(marks[j].width * 2. + 0.1),
                     )

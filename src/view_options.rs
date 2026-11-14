@@ -435,12 +435,26 @@ impl Editor {
         view: View,
         bypass: bool,
     ) -> Vec2 {
+        self.snap_translation_axes(bounds, delta, view, bypass, None)
+    }
+
+    pub(crate) fn snap_translation_axes(
+        &mut self,
+        bounds: Rect,
+        delta: Vec2,
+        view: View,
+        bypass: bool,
+        lock: Option<usize>,
+    ) -> Vec2 {
         self.view_options.feedback = [None, None];
         if bypass || !self.studio.prefs.view.snaps.any() {
             return delta;
         }
         let mut out = delta;
         for axis in 0..2 {
+            if lock.is_some_and(|active| active != axis) {
+                continue;
+            }
             let anchors = [
                 bounds.min[axis] + delta[axis],
                 bounds.center()[axis] + delta[axis],

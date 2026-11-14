@@ -38,6 +38,7 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         vec![
             ("mimetype", b"application/vnd.adobe.xfl"),
             ("DOMDocument.xml", xml.as_bytes()),
+            ("LIBRETOON/xfl-preview-v2", b"2"),
         ],
     )
 }
@@ -51,15 +52,72 @@ fn solid(color: [u8; 4]) -> String {
     )
 }
 fn document_xml(doc: &Document) -> String {
-    let baked = crate::features::baked(doc);
-    let doc = &baked;
+    render_document_xml(doc, false)
+}
+fn render_document_xml(doc: &Document, legacy: bool) -> String {
     let mut xml = format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?><DOMDocument xmlns=\"http://ns.adobe.com/xfl/2008/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" width=\"{}\" height=\"{}\" frameRate=\"{}\" backgroundColor=\"#FFFFFF\" xflVersion=\"2.97\" creatorInfo=\"LibreToon\" currentTimeline=\"1\"><timelines><DOMTimeline name=\"Escena 1\" currentFrame=\"0\"><layers>",
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><DOMDocument xmlns=\"http://ns.adobe.com/xfl/2008/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" width=\"{}\" height=\"{}\" frameRate=\"{}\" backgroundColor=\"#FFFFFF\" xflVersion=\"2.97\" creatorInfo=\"LibreToon\" currentTimeline=\"1\"><timelines>",
         doc.width, doc.height, doc.fps
     );
+    if legacy || doc.extras.scenes.is_empty() {
+        timeline_xml(&mut xml, &crate::features::baked(doc), "Escena 1", legacy);
+    } else {
+        for (index, scene) in doc.extras.scenes.iter().enumerate() {
+            let scene_doc = crate::animation::scene_doc(doc, index);
+            timeline_xml(
+                &mut xml,
+                &crate::features::baked(&scene_doc),
+                &scene.name,
+                false,
+            );
+        }
+    }
+    xml += "</timelines></DOMDocument>";
+    xml
+}
+fn timeline_xml(xml: &mut String, doc: &Document, name: &str, legacy: bool) {
+    *xml += &format!(
+        "<DOMTimeline name=\"{}\" currentFrame=\"0\"><layers>",
+        escape(name)
+    );
+    let folders: std::collections::HashMap<_, _> = doc
+        .extras
+        .folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect();
+    let mut folder_indices = std::collections::HashMap::new();
+    let mut next_index = 0;
     for layer in doc.layers.iter().rev() {
-        xml += &format!(
-            "<DOMLayer name=\"{}\" color=\"#5B9EFF\" visible=\"{}\"><frames>",
+        let mut attributes = String::new();
+        if !legacy {
+            let mut ancestors = Vec::new();
+            let mut parent = layer.options.folder;
+            while let Some(folder) = parent.and_then(|id| folders.get(&id)) {
+                ancestors.push(*folder);
+                parent = folder.parent;
+            }
+            let mut parent_attribute = String::new();
+            for folder in ancestors.into_iter().rev() {
+                let index = *folder_indices.entry(folder.id).or_insert_with(|| {
+                    *xml += &format!(
+                        "<DOMLayer name=\"{}\" layerType=\"folder\" isExpanded=\"{}\"{parent_attribute}><frames/></DOMLayer>",
+                        escape(&folder.name), !folder.collapsed,
+                    );
+                    let index = next_index;
+                    next_index += 1;
+                    index
+                });
+                parent_attribute = format!(" parentLayerIndex=\"{index}\"");
+            }
+            attributes = parent_attribute;
+            if layer.options.locked {
+                attributes.push_str(" locked=\"true\"");
+            }
+        }
+        next_index += 1;
+        *xml += &format!(
+            "<DOMLayer name=\"{}\" color=\"#5B9EFF\" visible=\"{}\"{attributes}><frames>",
             escape(&layer.name),
             layer.visible
         );
@@ -68,7 +126,7 @@ fn document_xml(doc: &Document) -> String {
                 continue;
             }
             let duration = layer.exposure(index).end - index;
-            xml += &format!(
+            *xml += &format!(
                 "<DOMFrame index=\"{index}\" duration=\"{duration}\" keyMode=\"9728\"><elements>"
             );
             let export_marks: Vec<_> = marks.iter().flat_map(crate::width::export_marks).collect();
@@ -82,21 +140,21 @@ fn document_xml(doc: &Document) -> String {
                 if rings[0].is_empty() {
                     continue;
                 }
-                xml += "<DOMShape isFloating=\"true\"><matrix><Matrix/></matrix>";
+                *xml += "<DOMShape isFloating=\"true\"><matrix><Matrix/></matrix>";
                 if let Some(fill) = mark.fill {
-                    xml += &format!(
+                    *xml += &format!(
                         "<fills><FillStyle index=\"1\">{}</FillStyle></fills>",
                         solid(fill)
                     );
                 }
                 if mark.stroke {
-                    xml += &format!(
+                    *xml += &format!(
                         "<strokes><StrokeStyle index=\"1\"><SolidStroke weight=\"{}\" caps=\"round\" joints=\"round\" scaleMode=\"none\"><fill>{}</fill></SolidStroke></StrokeStyle></strokes>",
                         mark.width,
                         solid(mark.color)
                     );
                 }
-                xml += "<edges>";
+                *xml += "<edges>";
                 for (i, mut ring) in rings.into_iter().enumerate() {
                     let mut reversed = false;
                     if ring.is_empty() {
@@ -135,20 +193,19 @@ fn document_xml(doc: &Document) -> String {
                     if ring.len() == 1 {
                         edges += &format!("|{} {}", ring[0].x * 20. + 0.02, ring[0].y * 20.);
                     }
-                    xml += &format!(
+                    *xml += &format!(
                         "<Edge strokeStyle=\"{}\" fillStyle1=\"{}\" edges=\"{edges}\"/>",
                         usize::from(mark.stroke),
                         usize::from(mark.fill.is_some())
                     );
                 }
-                xml += "</edges></DOMShape>";
+                *xml += "</edges></DOMShape>";
             }
-            xml += "</elements></DOMFrame>";
+            *xml += "</elements></DOMFrame>";
         }
-        xml += "</frames></DOMLayer>";
+        *xml += "</frames></DOMLayer>";
     }
-    xml += "</layers></DOMTimeline></timelines></DOMDocument>";
-    xml
+    *xml += "</layers></DOMTimeline>";
 }
 fn unsupported(what: &str) -> String {
     format!(
@@ -351,7 +408,12 @@ pub fn decode(bytes: &[u8]) -> Result<Document, String> {
     if let Ok(Some(native)) = &native {
         let archive = crate::fla_zip::Archive::new(bytes)?;
         if let Ok(doc) = crate::native_project::restore(&archive, native) {
-            if same_native_preview(&document_xml(&doc), &xml) {
+            if same_native_preview(&document_xml(&doc), &xml)
+                || (archive
+                    .entry(b"LIBRETOON/xfl-preview-v2")
+                    .is_ok_and(|entry| entry.is_none())
+                    && same_native_preview(&render_document_xml(&doc, true), &xml))
+            {
                 return Ok(doc);
             }
         }
@@ -371,6 +433,48 @@ mod tests {
     use super::*;
     use crate::canvas::transformed;
     use eframe::egui::{Pos2, Vec2};
+    #[test]
+    fn visible_xfl_keeps_scenes_and_nested_layer_folders() {
+        let mut doc = Document::default();
+        let parent = crate::features::id();
+        let child = crate::features::id();
+        for (id, name, parent) in [(parent, "Cast", None), (child, "Hero", Some(parent))] {
+            doc.extras.folders.push(crate::features::Folder {
+                id,
+                name: name.into(),
+                parent,
+                collapsed: false,
+                transform: Default::default(),
+                timeline_slot: None,
+                range: None,
+                source_shift: 0,
+            });
+        }
+        doc.layers[0].options.folder = Some(child);
+        doc.layers[0].options.locked = true;
+        for name in ["Opening", "Ending"] {
+            let scene = crate::animation::scene_from(&doc, crate::features::id(), name.into());
+            doc.extras.scenes.push(scene);
+        }
+        let xml =
+            document_xml(&doc).replacen("keyMode=\"9728\"", "keyMode=\"9728\" name=\"Start\"", 1);
+        let bytes = crate::fla_zip::pack(&[("DOMDocument.xml", xml.into_bytes())]);
+        let imported = decode(&bytes).unwrap();
+        assert_eq!(imported.extras.scenes[0].name, "Opening");
+        assert_eq!(imported.extras.scenes[1].name, "Ending");
+        assert_eq!(
+            imported.extras.folders[1].parent,
+            Some(imported.extras.folders[0].id)
+        );
+        assert_eq!(
+            imported.layers[0].options.folder,
+            Some(imported.extras.folders[1].id)
+        );
+        assert!(imported.layers[0].options.locked);
+        assert_eq!(imported.extras.markers[0].name, "Start");
+        assert!(imported.extras.scenes[1].markers.is_empty());
+    }
+
     #[test]
     fn native_preview_accepts_only_tiny_edge_rounding() {
         let xml = r#"<DOMDocument><Edge edges="!21410.85 11554.219|20 30"/></DOMDocument>"#;

@@ -4,6 +4,8 @@ use eframe::egui::{self, Color32, Pos2};
 pub struct Drawing {
     pub radius: f32,
     pub pressure: bool,
+    pub vector_pressure: bool,
+    stroke_pressure: bool,
     pub opacity: f32,
     pub hardness: f32,
     pub scroll_to_tab: bool,
@@ -22,6 +24,8 @@ impl Default for Drawing {
         Self {
             radius: 0.,
             pressure: true,
+            vector_pressure: false,
+            stroke_pressure: true,
             opacity: 1.,
             hardness: 0.3,
             scroll_to_tab: true,
@@ -50,13 +54,18 @@ impl Drawing {
         self.text.focus = false;
         self.text.transaction = false;
     }
-    pub fn start(&mut self, p: Pos2) {
+    pub fn start(&mut self, p: Pos2, tool: Tool) {
+        self.stroke_pressure = if tool == Tool::VectorBrush {
+            self.vector_pressure
+        } else {
+            self.pressure
+        };
         self.samples.clear();
         self.pressure_seen = false;
         self.sample(p);
     }
     pub fn sample(&mut self, p: Pos2) {
-        let force = if !self.pressure {
+        let force = if !self.stroke_pressure {
             1.
         } else if let Some(sample) = self.pen.force() {
             let force = sample.clamp(0.02, 1.);
@@ -87,11 +96,31 @@ impl Drawing {
         }
     }
     pub fn profile(&self, base: &[WidthStop]) -> SharedVec<WidthStop> {
-        if !self.pressure
-            || self.samples.iter().all(|(_, p)| (*p - 1.).abs() < 0.0001)
-            || self.samples.len() < 2
-        {
+        if !self.stroke_pressure || self.samples.iter().all(|(_, p)| (*p - 1.).abs() < 0.0001) {
             return base.to_vec().into();
+        }
+        if let [(_, pressure)] = self.samples.as_slice() {
+            let width = |t| (crate::width::sample(base, t) * *pressure).clamp(0., 4.);
+            return if base.is_empty() {
+                vec![
+                    WidthStop {
+                        t: 0.,
+                        width: width(0.),
+                    },
+                    WidthStop {
+                        t: 1.,
+                        width: width(1.),
+                    },
+                ]
+                .into()
+            } else {
+                base.iter()
+                    .map(|stop| WidthStop {
+                        t: stop.t,
+                        width: width(stop.t),
+                    })
+                    .collect()
+            };
         }
         let positions: Vec<_> = self.samples.iter().map(|s| s.0).collect();
         let (lengths, total) = crate::width::lengths(&positions);
@@ -266,24 +295,31 @@ impl Editor {
                 | Tool::SketchBrush
         ) {
             crate::design::category(ui, "TABLETA");
+            let pressure = if self.tool == Tool::VectorBrush {
+                &mut self.drawing.vector_pressure
+            } else {
+                &mut self.drawing.pressure
+            };
             if crate::design::button(
                 ui,
                 crate::design::Icon::Pressure,
                 "",
                 "Activar / desactivar presión de lápiz",
-                self.drawing.pressure,
+                *pressure,
                 true,
             )
             .clicked()
             {
-                self.drawing.pressure = !self.drawing.pressure;
+                *pressure = !*pressure;
             }
-            ui.label(if self.drawing.pressure {
+            ui.label(if *pressure {
                 crate::i18n::tr("Presión de lápiz activada")
             } else {
                 crate::i18n::tr("Presión de lápiz desactivada")
             });
-            ui.small(if self.drawing.pen.detected() {
+            ui.small(if !*pressure {
+                crate::i18n::tr("Constant stroke width")
+            } else if self.drawing.pen.detected() {
                 crate::i18n::tr("Lápiz detectado · presión → grosor")
             } else {
                 crate::i18n::tr("Ratón: grosor constante · esperando lápiz")
@@ -317,7 +353,7 @@ mod pressure_gap_tests {
     #[test]
     fn late_pressure_and_missing_release_packet_do_not_make_full_width_dots() {
         let mut drawing = Drawing::default();
-        drawing.start(Pos2::ZERO);
+        drawing.start(Pos2::ZERO, Tool::Brush);
         drawing.sample(Pos2::new(1., 0.));
         drawing.pen.test_pressure(Some(0.2));
         drawing.sample(Pos2::new(2., 0.));
@@ -330,7 +366,7 @@ mod pressure_gap_tests {
                 .iter()
                 .all(|sample| (sample.width - 0.2).abs() < 0.001)
         );
-        drawing.start(Pos2::ZERO);
+        drawing.start(Pos2::ZERO, Tool::Brush);
         drawing.sample(Pos2::new(1., 0.));
         assert!(drawing.profile(&[]).is_empty());
     }

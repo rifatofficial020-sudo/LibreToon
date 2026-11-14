@@ -9,6 +9,7 @@ mod appearance_tests;
 mod brush;
 mod bucket;
 mod canvas;
+mod character;
 #[cfg(test)]
 mod compat_tests;
 mod depth;
@@ -26,17 +27,22 @@ mod fla;
 mod fla_zip;
 mod folder_groups;
 mod frame_clipboard;
+mod frame_workflow;
+mod gpu_lens;
 mod i18n;
 mod inspector;
 #[cfg(test)]
 mod interaction_ux_tests;
 mod library;
+mod light;
+mod lip;
 mod loading;
 mod mannequin;
 mod media;
 mod native_project;
 mod ordering;
 mod paint;
+mod palette;
 mod post;
 mod project_save;
 mod raster;
@@ -80,6 +86,7 @@ struct Editor {
     references: reftool::State,
     raster_cleanup: usize,
     post: post::State,
+    lip: lip::State,
     vector_trim: vector_trim::State,
     media: media::MediaEditor,
     loader: loading::Loader,
@@ -175,6 +182,7 @@ impl Editor {
             references: Default::default(),
             raster_cleanup: 0,
             post: Default::default(),
+            lip: Default::default(),
             vector_trim: Default::default(),
             media: Default::default(),
             loader: Default::default(),
@@ -188,7 +196,7 @@ impl Editor {
             hub,
             drawing: Default::default(),
             feature: Default::default(),
-            depth: Default::default(),
+            depth: depth::DepthEditor::new(cc),
             animation: Default::default(),
             studio: studio::Studio::load(),
             doc: recovered.unwrap_or_else(fresh_document),
@@ -284,6 +292,7 @@ impl Editor {
         self.folder_groups.clear();
         self.vector_trim.clear();
         self.clips.reset_document();
+        self.cancel_adjustment_drag();
         self.rigging.cancel_gesture();
         let entry = if redo {
             self.redo.pop()
@@ -291,6 +300,7 @@ impl Editor {
             self.undo.pop()
         };
         if let Some(d) = entry {
+            self.feature.layer_selection = Default::default();
             self.hub.dirty();
             if redo {
                 self.undo.push(self.doc.clone())
@@ -327,24 +337,40 @@ fn fresh_document() -> Document {
     doc.layers[0].options.keys = keys.into();
     doc
 }
+#[cfg(test)]
 fn write_document(path: &std::path::Path, doc: &Document) -> Result<(), String> {
+    write_recovery_document(path, doc, None, |temporary, path| {
+        std::fs::rename(temporary, path)
+    })
+}
+
+fn write_recovery_document(
+    path: &std::path::Path,
+    doc: &Document,
+    cache: Option<&mut fla_zip::RecoveryCompression>,
+    publish: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     let temporary = path.with_extension("libretoon.tmp");
-    let file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
-    let mut writer = std::io::BufWriter::new(file);
-    if native_project::is_native_path(path) {
-        std::io::Write::write_all(&mut writer, &native_project::encode(doc)?)
-            .map_err(|e| e.to_string())?;
-    } else if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("fla"))
-    {
-        std::io::Write::write_all(&mut writer, &fla::encode(doc)?).map_err(|e| e.to_string())?;
-    } else {
-        serde_json::to_writer(&mut writer, doc).map_err(|e| e.to_string())?;
-    }
-    std::io::Write::flush(&mut writer).map_err(|e| e.to_string())?;
-    drop(writer);
-    std::fs::rename(&temporary, path).map_err(|e| e.to_string())
+    let result = (|| {
+        let file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
+        let mut writer = std::io::BufWriter::new(file);
+        if native_project::is_native_path(path) {
+            native_project::write_with_recovery_cache(doc, &mut writer, cache)?;
+        } else if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("fla"))
+        {
+            std::io::Write::write_all(&mut writer, &fla::encode(doc)?)
+                .map_err(|e| e.to_string())?;
+        } else {
+            serde_json::to_writer(&mut writer, doc).map_err(|e| e.to_string())?;
+        }
+        std::io::Write::flush(&mut writer).map_err(|e| e.to_string())?;
+        drop(writer);
+        publish(&temporary, path).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 impl eframe::App for Editor {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -364,6 +390,7 @@ impl eframe::App for Editor {
             self.save_project(false);
         }
         self.action_shortcuts(&ctx);
+        self.poll_lip_analysis();
         self.space_playback(&ctx);
         if self.profile_transaction && !ctx.input(|i| i.pointer.primary_down()) {
             self.profile_transaction = false;
@@ -441,6 +468,7 @@ impl eframe::App for Editor {
         }
         self.reference_windows(&ctx);
         self.annotation_dialog(&ctx);
+        self.lip_session_ui(&ctx);
         self.project_save_ui(&ctx);
         if self.studio.credits_open {
             egui::Window::new(crate::i18n::tr("Credits"))

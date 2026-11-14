@@ -58,6 +58,11 @@ impl Editor {
         if self.playing {
             return;
         }
+        let partial = !state.partial.is_empty();
+        if partial {
+            self.checkpoint();
+            self.materialize_fragments(state);
+        }
         let mut layers = std::collections::BTreeMap::<usize, Vec<usize>>::new();
         for &(l, m) in &state.selected {
             if self
@@ -81,9 +86,14 @@ impl Editor {
             })
             .collect();
         if plans.is_empty() {
+            if partial {
+                self.recover();
+            }
             return;
         }
-        self.checkpoint();
+        if !partial {
+            self.checkpoint();
+        }
         for (l, ids, order) in plans {
             let marks = &mut self.doc.layers[l].frames[self.frame];
             let before = marks.clone();

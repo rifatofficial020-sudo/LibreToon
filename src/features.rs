@@ -128,6 +128,28 @@ pub struct Instance {
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MarkStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) palette_fill: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) palette_stroke: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub primitive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_pivot: Option<[f32; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_folder: Option<[u64; 2]>,
+    #[serde(skip_serializing_if = "SharedVec::is_empty")]
+    pub mouth_keys: SharedVec<crate::lip::Key>,
+    #[serde(skip_serializing_if = "SharedVec::is_empty")]
+    pub mouth_routes: SharedVec<crate::lip::Route>,
+    #[serde(skip)]
+    pub surface_height: Option<f32>,
+    #[serde(skip)]
+    pub light_mask: bool,
+    #[serde(skip)]
+    pub light_mask_target: Option<u64>,
+    #[serde(skip)]
+    pub surface_piece: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub animation_clip: Option<crate::animation_clips::Timing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,14 +168,62 @@ pub struct MarkStyle {
     pub end_cap: Cap,
     pub instance: Option<Instance>,
 }
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum ObjectFolderMode {
+    #[default]
+    Normal,
+    Switch,
+    Solo,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectFolder {
+    pub id: u64,
+    pub name: String,
+    pub mode: ObjectFolderMode,
+    pub choices: SharedVec<(usize, u64)>,
+}
+
+impl ObjectFolder {
+    pub fn choice(&self, frame: usize) -> Option<u64> {
+        match self.mode {
+            ObjectFolderMode::Normal => None,
+            ObjectFolderMode::Solo => self.choices.last().map(|choice| choice.1),
+            ObjectFolderMode::Switch => self
+                .choices
+                .iter()
+                .rev()
+                .find(|choice| choice.0 <= frame)
+                .or_else(|| self.choices.first())
+                .map(|choice| choice.1),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayerOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) character_piece: Option<crate::character::Piece>,
     pub composition: crate::folder_groups::LayerGroup,
     pub animation_track: bool,
     pub raster: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adjustment: Option<SharedVec<crate::post::Effect>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjustment_bands: Option<SharedVec<crate::post::Band>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fx_target: Option<crate::light::Receiver>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light: Option<crate::light::Light>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_receiver: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_guide: Option<f32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub light_mask: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_mask_target: Option<u64>,
     pub depth: crate::depth::LayerDepth,
     pub mannequin: Option<crate::mannequin::Mannequin>,
     pub tweens: SharedVec<crate::animation::Tween>,
@@ -166,14 +236,26 @@ pub struct LayerOptions {
     pub masked_by: Option<u64>,
     pub folder: Option<u64>,
     pub keys: SharedVec<bool>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) drawing_classes: std::collections::BTreeMap<usize, u8>,
+    #[serde(skip_serializing_if = "SharedVec::is_empty")]
+    pub object_folders: SharedVec<ObjectFolder>,
 }
 impl Default for LayerOptions {
     fn default() -> Self {
         Self {
+            character_piece: None,
             composition: Default::default(),
             animation_track: false,
             raster: false,
             adjustment: None,
+            adjustment_bands: None,
+            fx_target: None,
+            light: None,
+            light_receiver: None,
+            height_guide: None,
+            light_mask: false,
+            light_mask_target: None,
             depth: Default::default(),
             mannequin: None,
             locked: false,
@@ -184,9 +266,24 @@ impl Default for LayerOptions {
             masked_by: None,
             folder: None,
             keys: Default::default(),
+            drawing_classes: Default::default(),
+            object_folders: Default::default(),
         }
     }
 }
+pub(crate) fn object_visible(layer: &Layer, mark: &Mark, frame: usize) -> bool {
+    let Some([folder, object]) = mark.style.object_folder else {
+        return true;
+    };
+    layer
+        .options
+        .object_folders
+        .iter()
+        .find(|item| item.id == folder)
+        .and_then(|item| item.choice(frame))
+        .is_none_or(|choice| choice == object)
+}
+
 pub fn default_style(style: &MarkStyle) -> bool {
     *style == MarkStyle::default()
 }
@@ -194,7 +291,10 @@ pub fn default_layer_options(options: &LayerOptions) -> bool {
     *options == LayerOptions::default()
 }
 pub fn default_extras(extras: &ProjectExtras) -> bool {
-    extras.markers.is_empty()
+    extras.palette.is_empty()
+        && extras.main_palettes.is_empty()
+        && extras.rig_poses.is_empty()
+        && extras.markers.is_empty()
         && extras.tags.is_empty()
         && extras.references.is_empty()
         && extras.animation_library.is_empty()
@@ -218,6 +318,8 @@ pub struct Folder {
     pub name: String,
     pub parent: Option<u64>,
     pub collapsed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_slot: Option<usize>,
     #[serde(default)]
     pub transform: crate::folder_groups::Transform,
     #[serde(default)]
@@ -227,6 +329,8 @@ pub struct Folder {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Symbol {
+    #[serde(default, skip_serializing_if = "SharedVec::is_empty")]
+    pub mouth_poses: SharedVec<crate::lip::Pose>,
     #[serde(default)]
     pub rig: crate::rig::Rig,
     #[serde(default)]
@@ -273,6 +377,12 @@ impl Default for Perspective {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectExtras {
+    #[serde(skip_serializing_if = "SharedVec::is_empty")]
+    pub(crate) palette: SharedVec<crate::palette::Swatch>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) main_palettes: std::collections::BTreeMap<usize, SharedVec<[u8; 4]>>,
+    #[serde(default, skip_serializing_if = "SharedVec::is_empty")]
+    pub(crate) rig_poses: SharedVec<crate::rig::SavedPose>,
     pub markers: SharedVec<crate::dialogue::Marker>,
     pub tags: SharedVec<crate::dialogue::Tag>,
     pub references: SharedVec<crate::reftool::Reference>,
@@ -306,6 +416,7 @@ pub struct FrameDrag {
     pub target: Option<usize>,
 }
 pub struct FeatureState {
+    pub(crate) pen_edit_only: bool,
     pub toon_levels: u8,
     pub gradient_on: bool,
     pub gradient: Gradient,
@@ -317,9 +428,14 @@ pub struct FeatureState {
     pub selected_camera: Option<u64>,
     pub symbol_stack: Vec<(Document, usize, usize, u64)>,
     pub frame_selection: Option<(usize, usize, usize)>,
+    pub(crate) bucket_range_armed: bool,
+    pub(crate) bucket_next: bool,
+    pub(crate) bucket_next_count: usize,
+    pub(crate) bucket_range: Option<crate::canvas::BucketRange>,
     pub frame_drag: Option<FrameDrag>,
     pub exposure_drag: Option<crate::exposure_resize::Drag>,
     pub row_drag: Option<(bool, usize)>,
+    pub(crate) layer_selection: crate::sequencer::LayerSelection,
     pub camera_drag: Option<usize>,
     pub camera_trim: Option<CameraTrim>,
     pub guide_drag: Option<usize>,
@@ -328,6 +444,7 @@ pub struct FeatureState {
 impl Default for FeatureState {
     fn default() -> Self {
         Self {
+            pen_edit_only: false,
             toon_levels: 1,
             gradient_on: false,
             gradient: Default::default(),
@@ -339,9 +456,14 @@ impl Default for FeatureState {
             selected_camera: None,
             symbol_stack: vec![],
             frame_selection: None,
+            bucket_range_armed: false,
+            bucket_next: false,
+            bucket_next_count: 2,
+            bucket_range: None,
             frame_drag: None,
             exposure_drag: None,
             row_drag: None,
+            layer_selection: Default::default(),
             camera_drag: None,
             camera_trim: None,
             guide_drag: None,
@@ -458,6 +580,9 @@ fn expand(
     guides: bool,
     clock: usize,
     poses: &std::collections::HashMap<u64, crate::rig::Pose>,
+    mouth: Option<crate::lip::RouteScope<'_>>,
+    surfaces: bool,
+    piece: u64,
 ) {
     if mark.style.guide && !guides {
         return;
@@ -471,6 +596,11 @@ fn expand(
         };
         let count = symbol.layers.first().map_or(1, |l| l.frames.len()).max(1);
         let parent_frame = rig_frame;
+        let mouth = if mouth.is_none() && !mark.style.mouth_routes.is_empty() {
+            Some(crate::lip::RouteScope::new(&mark.style.mouth_routes, frame))
+        } else {
+            mouth
+        };
         let frame = mark
             .style
             .animation_clip
@@ -478,7 +608,20 @@ fn expand(
             .and_then(|timing| {
                 crate::animation_clips::source_frame(doc, timing, instance.born, frame)
             })
-            .unwrap_or_else(|| symbol_frame(instance, count, frame, clock));
+            .or_else(|| {
+                mouth
+                    .as_ref()
+                    .and_then(crate::lip::RouteScope::pose)
+                    .or_else(|| crate::lip::pose_at(&mark.style.mouth_keys, frame))
+                    .filter(|&pose| pose < count)
+            })
+            .unwrap_or_else(|| {
+                if symbol.mouth_poses.is_empty() {
+                    symbol_frame(instance, count, frame, clock)
+                } else {
+                    instance.first.min(count - 1)
+                }
+            });
         let mut sub = doc.clone();
         sub.layers = symbol.layers.clone();
         sub.extras.cameras = Default::default();
@@ -491,19 +634,45 @@ fn expand(
             .iter()
             .find(|b| b.target == mark.style.track && b.symbol == instance.symbol);
         let deform = binding.map(|b| crate::rig::Deformer::new(b, poses, parent_frame));
-        for (_, _, mut m) in resolve_internal(
-            &sub,
-            frame,
-            depth + 1,
-            guides,
-            if mark.style.animation_clip.is_some() {
-                frame
-            } else {
-                clock
-                    .saturating_sub(instance.born)
-                    .saturating_add(instance.first)
-            },
-        ) {
+        let replacement = crate::character::artwork(
+            doc,
+            mark.style.track,
+            parent_frame,
+            (!symbol.mouth_poses.is_empty()).then_some(frame),
+        );
+        let resolved = if let Some((layers, view)) = replacement {
+            sub.layers = layers;
+            sub.extras.rig = Default::default();
+            sub.extras.folders = Default::default();
+            resolve_internal(
+                &sub,
+                view,
+                depth + 1,
+                guides,
+                clock,
+                mouth.as_ref(),
+                surfaces,
+                piece,
+            )
+        } else {
+            resolve_internal(
+                &sub,
+                frame,
+                depth + 1,
+                guides,
+                if mark.style.animation_clip.is_some() {
+                    frame
+                } else {
+                    clock
+                        .saturating_sub(instance.born)
+                        .saturating_add(instance.first)
+                },
+                mouth.as_ref(),
+                surfaces,
+                piece,
+            )
+        };
+        for (_, _, mut m) in resolved {
             if let Some(c) = mark.style.instance_color {
                 apply_color(&mut m, c);
             }
@@ -545,6 +714,9 @@ fn resolve_internal(
     depth: usize,
     guides: bool,
     clock: usize,
+    mouth: Option<&crate::lip::RouteScope<'_>>,
+    surfaces: bool,
+    scope: u64,
 ) -> Vec<(usize, usize, Mark)> {
     let mut pose_cache = std::collections::HashMap::new();
     let mut previous_folder = crate::rig::IDENTITY;
@@ -552,9 +724,14 @@ fn resolve_internal(
     let mut output = vec![];
     let mut below = vec![];
     for (l, layer) in doc.layers.iter().enumerate() {
+        let guide = layer.options.height_guide.is_some() || layer.options.light_mask;
+        if guide && !(surfaces || guides && depth == 0 && layer.options.light_mask_target.is_none())
+        {
+            continue;
+        }
         if layer.options.mannequin.is_some()
             || layer.options.mask_id.is_some()
-            || layer.options.adjustment.is_some()
+            || crate::post::is_adjustment(layer)
         {
             continue;
         }
@@ -564,9 +741,26 @@ fn resolve_internal(
         }
         let folder = crate::folder_groups::layer_matrix(doc, layer);
         let rig_frame = crate::folder_groups::rig_frame(doc, layer, frame);
+        let character_poses = |frame| {
+            let rig = &doc.extras.rig;
+            let joints = crate::character::view_joints(doc, rig, frame);
+            if joints.is_empty() {
+                return rig.poses(frame);
+            }
+            let mut rig = rig.clone();
+            for bone in &mut rig.bones {
+                if let Some((_, [start, end])) = joints.iter().find(|(id, _)| *id == bone.id)
+                    && crate::vector::pos(*start).distance(crate::vector::pos(*end)) > 0.01
+                {
+                    bone.start = *start;
+                    bone.end = *end;
+                }
+            }
+            rig.poses(frame)
+        };
         let poses = pose_cache
             .entry(rig_frame)
-            .or_insert_with(|| doc.extras.rig.poses(rig_frame));
+            .or_insert_with(|| character_poses(rig_frame));
         let mut current = vec![];
         let mask = if let Some(id) = layer.options.masked_by {
             let source = explicit_masks.entry(id).or_insert_with(|| {
@@ -577,12 +771,16 @@ fn resolve_internal(
                 let mut marks = Vec::new();
                 if crate::folder_groups::layer_active(doc, source, frame) {
                     let rig_frame = crate::folder_groups::rig_frame(doc, source, frame);
-                    let poses = doc.extras.rig.poses(rig_frame);
+                    let poses = character_poses(rig_frame);
                     for mark in
                         crate::animation::marks(source, frame.min(source.frames.len() - 1)).iter()
                     {
+                        if !object_visible(source, mark, frame) {
+                            continue;
+                        }
                         expand(
                             doc, mark, frame, rig_frame, depth, &mut marks, false, clock, &poses,
+                            None, false, 0,
                         );
                     }
                 }
@@ -612,10 +810,23 @@ fn resolve_internal(
         } else {
             None
         };
-        for (m, mark) in crate::animation::marks(layer, frame.min(layer.frames.len() - 1))
-            .iter()
-            .enumerate()
-        {
+        let first_output = output.len();
+        let marks = crate::animation::marks(layer, frame.min(layer.frames.len() - 1));
+        let mut arranged = Vec::new();
+        let natural = marks.iter().enumerate();
+        let ordered: &mut dyn Iterator<Item = (usize, &Mark)> =
+            if doc.extras.rig.character_symbol.is_some() {
+                arranged.extend(natural);
+                arranged
+                    .sort_by_cached_key(|(_, mark)| crate::character::order(doc, mark, rig_frame));
+                &mut arranged.drain(..)
+            } else {
+                &mut marks.iter().enumerate()
+            };
+        for (m, mark) in ordered {
+            if !object_visible(layer, mark, frame) {
+                continue;
+            }
             let mut expanded = vec![];
             expand(
                 doc,
@@ -627,6 +838,11 @@ fn resolve_internal(
                 guides,
                 clock,
                 poses,
+                mouth.and_then(|scope| scope.child(l, m, mark)),
+                surfaces,
+                scope
+                    .wrapping_mul(0x100000001b3)
+                    .wrapping_add(((l as u64 + 1) << 32) | (m as u64 + 1)),
             );
             for original in expanded {
                 let parts = mask
@@ -643,7 +859,22 @@ fn resolve_internal(
                             s.color[3] = (s.color[3] as f32 * alpha).round() as u8;
                         }
                     }
-                    current.push(part.clone());
+                    if surfaces {
+                        if part.style.surface_piece == 0 {
+                            part.style.surface_piece =
+                                scope.wrapping_mul(0x100000001b3).wrapping_add(l as u64 + 1);
+                        }
+                        part.style.surface_height =
+                            layer.options.height_guide.or(part.style.surface_height);
+                        part.style.light_mask |= layer.options.light_mask;
+                        part.style.light_mask_target = layer
+                            .options
+                            .light_mask_target
+                            .or(part.style.light_mask_target);
+                    }
+                    if part.style.surface_height.is_none() && !part.style.light_mask && !guide {
+                        current.push(part.clone());
+                    }
                     output.push((
                         l,
                         m,
@@ -656,16 +887,26 @@ fn resolve_internal(
                 }
             }
         }
-        below = current;
-        previous_folder = folder;
+        if surfaces && layer.options.light_mask && output.len() == first_output {
+            // A visible empty mask is still a mask. Erasing the last stroke must
+            // leave an empty matte rather than restore unrestricted lighting.
+            let mut empty = Mark::default();
+            empty.style.light_mask = true;
+            empty.style.light_mask_target = layer.options.light_mask_target;
+            output.push((l, 0, empty));
+        }
+        if !guide {
+            below = current;
+            previous_folder = folder;
+        }
     }
     output
 }
 pub fn resolve(doc: &Document, frame: usize, camera: bool) -> Vec<(usize, usize, Mark)> {
-    resolve_mode(doc, frame, camera, true, frame)
+    resolve_mode(doc, frame, camera, true, frame, false)
 }
 pub fn resolve_export(doc: &Document, frame: usize, camera: bool) -> Vec<(usize, usize, Mark)> {
-    resolve_mode(doc, frame, camera, false, frame)
+    resolve_mode(doc, frame, camera, false, frame, false)
 }
 fn resolve_mode(
     doc: &Document,
@@ -673,36 +914,41 @@ fn resolve_mode(
     camera: bool,
     guides: bool,
     clock: usize,
+    surfaces: bool,
 ) -> Vec<(usize, usize, Mark)> {
-    let mut marks = resolve_internal(doc, frame, 0, guides, clock);
+    let mut marks = resolve_internal(doc, frame, 0, guides, clock, None, surfaces, 0);
     if camera || !guides {
         for (l, _, mark) in &mut marks {
             let matrix = crate::folder_groups::layer_matrix(doc, &doc.layers[*l]);
             *mark = crate::folder_groups::mark(mark, matrix);
         }
     }
-    if camera {
-        if let Some(c) = doc
-            .extras
-            .cameras
-            .iter()
-            .find(|c| frame >= c.start && frame < c.start + c.duration)
-        {
-            let optics = crate::animation::camera_optics(c, frame);
-            let c = crate::animation::camera_at(c, frame);
-            marks.retain(|(l, _, _)| crate::depth::visible(&doc.layers[*l].options.depth, &optics));
-            for (l, _, m) in &mut marks {
-                *m = crate::depth::project_mark(doc, &c, &optics, &doc.layers[*l].options.depth, m);
-                *m = crate::vector::transform(m, |p| {
-                    Pos2::new(doc.width as f32 / 2., doc.height as f32 / 2.)
-                        + crate::canvas::rotate(p - crate::vector::pos(c.center), -c.angle) * c.zoom
-                });
-                m.width *= c.zoom;
-            }
-        }
+    if camera && let Some(track) = crate::depth::camera(doc, frame) {
+        let optics = crate::animation::camera_optics(track, frame);
+        marks.retain(|(l, _, _)| crate::depth::visible(&doc.layers[*l].options.depth, &optics));
+        project_camera_marks(doc, frame, track, &optics, &mut marks);
     }
     marks
 }
+
+pub(crate) fn project_camera_marks(
+    doc: &Document,
+    frame: usize,
+    track: &Camera,
+    optics: &crate::depth::Optics,
+    marks: &mut [(usize, usize, Mark)],
+) {
+    let c = crate::animation::camera_at(track, frame);
+    let center = Pos2::new(doc.width as f32 / 2., doc.height as f32 / 2.);
+    for (l, _, m) in marks {
+        *m = crate::depth::project_mark(doc, &c, optics, &doc.layers[*l].options.depth, m);
+        *m = crate::vector::transform(m, |p| {
+            center + crate::canvas::rotate(p - crate::vector::pos(c.center), -c.angle) * c.zoom
+        });
+        m.width *= c.zoom;
+    }
+}
+
 pub fn baked(doc: &Document) -> Document {
     if doc.extras.rig.is_empty()
         && doc
@@ -714,7 +960,8 @@ pub fn baked(doc: &Document) -> Document {
         && doc.extras.symbols.is_empty()
         && doc.extras.cameras.is_empty()
         && doc.layers.iter().all(|l| {
-            l.options.composition == crate::folder_groups::LayerGroup::default()
+            l.options.object_folders.is_empty()
+                && l.options.composition == crate::folder_groups::LayerGroup::default()
                 && l.options.tweens.is_empty()
                 && l.options.tweens.is_empty()
                 && l.options.mannequin.is_none()
@@ -787,19 +1034,39 @@ pub fn validate(doc: &Document) -> Result<(), String> {
         .chain(doc.extras.scenes.iter().flat_map(|s| s.layers.iter()))
         .chain(doc.extras.symbols.iter().flat_map(|s| s.layers.iter()))
     {
-        if let Some(effects) = &layer.options.adjustment
-            && (!crate::post::valid(effects)
-                || layer.options.raster
-                || layer.options.animation_track
-                || layer.frames.iter().any(|frame| !frame.is_empty()))
+        if layer
+            .options
+            .height_guide
+            .is_some_and(|v| !(-1. ..=1.).contains(&v))
         {
-            return Err("Invalid adjustment layer".into());
+            return Err("Invalid height guide".into());
+        }
+        if !crate::post::valid_bands(layer)
+            || (crate::post::is_adjustment(layer)
+                && (layer
+                    .options
+                    .adjustment
+                    .as_ref()
+                    .is_some_and(|effects| !crate::post::valid(effects))
+                    || layer
+                        .options
+                        .light
+                        .as_ref()
+                        .is_some_and(|light| !light.valid())
+                    || layer.options.raster
+                    || layer.options.animation_track
+                    || layer.frames.iter().any(|frame| !frame.is_empty())))
+        {
+            return Err("Invalid effect or light layer".into());
         }
     }
     doc.extras.rig.validate()?;
     doc.extras.library.validate(&doc.extras.symbols)?;
     for symbol in &doc.extras.symbols {
         symbol.rig.validate()?;
+        if symbol.mouth_poses.len() > 128 || symbol.mouth_poses.iter().any(|name| !name.valid()) {
+            return Err("Invalid Lip Sync poses".into());
+        }
     }
     if doc.extras.folders.len() > 200
         || doc.extras.symbols.len() > 500
@@ -890,6 +1157,13 @@ pub fn validate(doc: &Document) -> Result<(), String> {
         if count == 0 || count > 10000 || symbol.layers.iter().any(|l| l.frames.len() != count) {
             return Err("Invalid symbol timeline".into());
         }
+        if symbol.layers.iter().any(|layer| {
+            layer.options.character_piece.as_ref().is_some_and(|piece| {
+                !matches!(count, 8 | crate::character::FACE_FRAMES) || !piece.valid()
+            })
+        }) {
+            return Err("Invalid character view".into());
+        }
     }
     Ok(())
 }
@@ -946,6 +1220,22 @@ fn validate_resources(doc: &Document) -> Result<(), String> {
     fn layers(layers: &[Layer], symbols: &[Symbol]) -> Result<(), String> {
         let mut checked = std::collections::HashSet::new();
         for layer in layers {
+            let mut folder_ids = std::collections::HashSet::new();
+            if layer.options.object_folders.len() > 200
+                || layer.options.object_folders.iter().any(|folder| {
+                    folder.id == 0
+                        || !folder_ids.insert(folder.id)
+                        || folder.name.len() > 256
+                        || folder.choices.len() > 10000
+                        || folder
+                            .choices
+                            .iter()
+                            .any(|&(frame, object)| frame >= 10000 || object == 0)
+                        || folder.choices.windows(2).any(|keys| keys[0].0 >= keys[1].0)
+                })
+            {
+                return Err("Invalid object folders".into());
+            }
             if !layer.options.composition.valid() {
                 return Err("Invalid layer composition".into());
             }
@@ -982,6 +1272,19 @@ fn validate_resources(doc: &Document) -> Result<(), String> {
                     .is_some_and(|c| c.iter().any(|v| !v.is_finite() || v.abs() > 1e7))
                 {
                     return Err("Invalid instance color transform".into());
+                }
+                let keys = &mark.style.mouth_keys;
+                if keys.len() > 10_000
+                    || keys
+                        .iter()
+                        .any(|key| key.frame >= 10_000 || key.pose >= 128)
+                    || !keys.windows(2).all(|pair| pair[0].frame < pair[1].frame)
+                    || !keys.is_empty() && mark.style.instance.is_none()
+                {
+                    return Err("Invalid Lip Sync keys".into());
+                }
+                if !crate::lip::valid_routes(&mark.style.mouth_routes) {
+                    return Err("Invalid nested Lip Sync channels".into());
                 }
                 if mark.style.text.as_ref().is_some_and(|t| !t.valid()) {
                     return Err("Invalid text".into());
@@ -1200,7 +1503,7 @@ pub fn resolve_preview(
     camera: bool,
     clock: usize,
 ) -> Vec<(usize, usize, Mark)> {
-    resolve_mode(doc, frame, camera, false, clock)
+    resolve_mode(doc, frame, camera, false, clock, true)
 }
 pub fn resolve_at(
     doc: &Document,
@@ -1208,7 +1511,7 @@ pub fn resolve_at(
     camera: bool,
     clock: usize,
 ) -> Vec<(usize, usize, Mark)> {
-    resolve_mode(doc, frame, camera, true, clock)
+    resolve_mode(doc, frame, camera, true, clock, false)
 }
 pub fn symbol_frame(i: &Instance, count: usize, frame: usize, clock: usize) -> usize {
     let count = count.max(1);

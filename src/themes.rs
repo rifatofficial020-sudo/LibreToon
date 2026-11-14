@@ -16,6 +16,10 @@ pub enum Theme {
     Sand,
     Aurora,
     Ember,
+    LightMidnight,
+    LightForest,
+    LightAurora,
+    LightGraphite,
 }
 #[derive(Clone, Copy)]
 pub struct Palette {
@@ -31,30 +35,39 @@ pub struct Palette {
 }
 thread_local! {static CURRENT:std::cell::Cell<Theme>=const{std::cell::Cell::new(Theme::Studio)};}
 impl Theme {
-    pub const ALL: [Self; 10] = [
-        Self::Studio,
+    // Each light/dark pair occupies the same row in the two preference columns.
+    pub const ALL: [Self; 14] = [
         Self::Paper,
+        Self::Studio,
+        Self::LightMidnight,
         Self::Midnight,
+        Self::LightForest,
         Self::Forest,
-        Self::Plum,
-        Self::Graphite,
-        Self::Porcelain,
-        Self::Sand,
+        Self::LightAurora,
         Self::Aurora,
+        Self::Porcelain,
+        Self::Plum,
+        Self::LightGraphite,
+        Self::Graphite,
+        Self::Sand,
         Self::Ember,
     ];
     pub fn name(self) -> &'static str {
         match self {
-            Self::Studio => "Estudio oscuro",
-            Self::Paper => "Papel claro",
-            Self::Midnight => "Medianoche",
-            Self::Forest => "Bosque",
-            Self::Plum => "Ciruela",
-            Self::Graphite => "Grafito",
-            Self::Porcelain => "Porcelain",
-            Self::Sand => "Sand",
-            Self::Aurora => "Aurora",
-            Self::Ember => "Ember",
+            Self::Paper => "Studio",
+            Self::Studio => "Dark Studio",
+            Self::LightMidnight => "Ocean",
+            Self::Midnight => "Dark Ocean",
+            Self::LightForest => "Forest",
+            Self::Forest => "Dark Forest",
+            Self::LightAurora => "Aurora",
+            Self::Aurora => "Dark Aurora",
+            Self::Porcelain => "Plum",
+            Self::Plum => "Dark Plum",
+            Self::LightGraphite => "Graphite",
+            Self::Graphite => "Dark Graphite",
+            Self::Sand => "Ember",
+            Self::Ember => "Dark Ember",
         }
     }
     pub fn description(self) -> &'static str {
@@ -69,6 +82,10 @@ impl Theme {
             Self::Sand => "Warm cream panels with terracotta accents.",
             Self::Aurora => "Deep teal panels with luminous lime accents.",
             Self::Ember => "Charcoal aubergine panels with coral accents.",
+            Self::LightMidnight => "Light blue panels with ocean accents.",
+            Self::LightForest => "Light sage panels with forest green accents.",
+            Self::LightAurora => "Pale lime panels with olive accents.",
+            Self::LightGraphite => "Warm ivory panels with amber accents.",
         }
     }
     pub fn palette(self) -> Palette {
@@ -183,6 +200,50 @@ impl Theme {
                 [255, 151, 123],
                 [101, 53, 55],
                 false,
+            ),
+            Self::LightMidnight => (
+                [235, 247, 250],
+                [211, 231, 239],
+                [220, 240, 245],
+                [146, 177, 187],
+                [19, 49, 62],
+                [57, 87, 104],
+                [0, 108, 132],
+                [190, 231, 242],
+                true,
+            ),
+            Self::LightForest => (
+                [241, 248, 240],
+                [219, 233, 220],
+                [230, 241, 228],
+                [150, 180, 153],
+                [32, 55, 40],
+                [62, 92, 70],
+                [26, 111, 63],
+                [198, 233, 204],
+                true,
+            ),
+            Self::LightAurora => (
+                [246, 250, 234],
+                [226, 235, 208],
+                [236, 244, 219],
+                [165, 182, 137],
+                [45, 59, 25],
+                [75, 93, 49],
+                [82, 110, 12],
+                [217, 235, 175],
+                true,
+            ),
+            Self::LightGraphite => (
+                [251, 247, 236],
+                [236, 226, 207],
+                [246, 237, 216],
+                [184, 165, 123],
+                [61, 46, 24],
+                [100, 82, 49],
+                [141, 89, 9],
+                [249, 225, 170],
+                true,
             ),
         };
         Palette {
@@ -349,7 +410,7 @@ pub fn selector(ui: &mut egui::Ui, selected: &mut Theme) -> bool {
                                         Stroke::new(2., color),
                                     );
                                 }
-                                ui.selectable_value(selected, theme, crate::i18n::tr(theme.name()));
+                                ui.selectable_value(selected, theme, theme.name());
                             });
                         }
                     },

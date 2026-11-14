@@ -40,6 +40,7 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
 }
 
 struct Job {
+    target: PathBuf,
     result: mpsc::Receiver<Result<(PathBuf, Stamp), SaveError>>,
     recovery: PathBuf,
     revision: u64,
@@ -60,6 +61,7 @@ impl From<io::Error> for SaveError {
 pub struct State {
     job: Option<Job>,
     conflict: Option<(PathBuf, bool)>,
+    error: Option<String>,
     next: Option<Instant>,
     schedule: Option<(bool, bool, u32)>,
     pending: std::collections::VecDeque<PathBuf>,
@@ -116,9 +118,10 @@ fn write_snapshot(
     expected: Option<Stamp>,
     incremental: bool,
 ) -> Result<(PathBuf, Stamp), SaveError> {
+    let exists = target.try_exists()?;
     let unchanged = || -> Result<bool, SaveError> {
-        Ok(if let Some(expected) = expected {
-            stamp(target) == Some(expected)
+        Ok(if exists {
+            expected.is_some_and(|expected| stamp(target) == Some(expected))
         } else {
             !target.try_exists()?
         })
@@ -140,17 +143,13 @@ fn write_snapshot(
             .create_new(true)
             .open(&temporary)?;
         let mut writer = io::BufWriter::new(file);
-        if crate::native_project::is_native_path(target)
-            || target
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("fla"))
+        if crate::native_project::is_native_path(target) {
+            crate::native_project::write(doc, &mut writer).map_err(SaveError::Failed)?;
+        } else if target
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("fla"))
         {
-            let bytes = if crate::native_project::is_native_path(target) {
-                crate::native_project::encode(doc)
-            } else {
-                crate::fla::encode(doc)
-            }
-            .map_err(SaveError::Failed)?;
+            let bytes = crate::fla::encode(doc).map_err(SaveError::Failed)?;
             if bytes.len() > 256 * 1024 * 1024 {
                 return Err(SaveError::Failed(
                     "Project exceeds the 256 MiB opening limit".into(),
@@ -164,8 +163,18 @@ fn write_snapshot(
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);
-        let written = stamp(&temporary)
-            .ok_or_else(|| SaveError::Failed("Cannot read saved file metadata".into()))?;
+        let size = fs::metadata(&temporary)?.len();
+        let published = |path: PathBuf| {
+            let stamp = stamp(&path)
+                .filter(|stamp| stamp.length == size)
+                .ok_or_else(|| {
+                    SaveError::Failed(format!(
+                        "Could not verify the saved project at {}",
+                        path.display()
+                    ))
+                })?;
+            Ok((path, stamp))
+        };
         if incremental {
             let stem = target.file_stem().unwrap_or_default().to_string_lossy();
             let base = increment_base(&stem);
@@ -190,7 +199,7 @@ fn write_snapshot(
                     .ok_or_else(|| SaveError::Failed("No available version number".into()))?;
                 let version = target.with_file_name(format!("{base}_v{latest}.{ext}"));
                 match publish_new(&temporary, &version) {
-                    Ok(()) => return Ok((version, written)),
+                    Ok(()) => return published(version),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(e) => return Err(e.into()),
                 }
@@ -199,7 +208,7 @@ fn write_snapshot(
         if !unchanged()? {
             return Err(SaveError::Conflict);
         }
-        if expected.is_none() {
+        if !exists {
             match publish_new(&temporary, target) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -224,7 +233,7 @@ fn write_snapshot(
             }
             fs::rename(&temporary, target)?;
         }
-        Ok((target.to_path_buf(), written))
+        published(target.to_path_buf())
     })();
     let _ = fs::remove_file(temporary);
     result
@@ -283,7 +292,11 @@ impl Editor {
                 self.status = tr("Choose a .ltoon file for the project.").into();
                 return;
             }
-            let path = path.canonicalize().unwrap_or(path);
+            let path = if choose {
+                path.canonicalize().unwrap_or(path)
+            } else {
+                path
+            };
             if choose && self.doc.extras.imported && self.path.as_ref() == Some(&path) {
                 self.status =
                     tr("Choose a different name to preserve the original Animate file.").into();
@@ -334,6 +347,7 @@ impl Editor {
         document.extras.imported = false;
         let (send, result) = mpsc::channel();
         self.project_save.job = Some(Job {
+            target: path.clone(),
             result,
             recovery: record.recovery.clone(),
             revision: record.revision,
@@ -354,11 +368,62 @@ impl Editor {
         let Some(index) = self.hub.active else {
             return;
         };
+        let document = self.project_document();
+        let layers = document
+            .layers
+            .iter()
+            .chain(
+                document
+                    .extras
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| scene.layers.iter()),
+            )
+            .chain(
+                document
+                    .extras
+                    .symbols
+                    .iter()
+                    .flat_map(|symbol| symbol.layers.iter()),
+            );
+        let (mut raster, mut effects) = (false, false);
+        for layer in layers {
+            raster |= layer.options.raster;
+            effects |= layer.options.light.is_some() || crate::post::is_adjustment(layer);
+        }
+        let mut description = tr("The FLA preview preserves compatible vector artwork and timing. Media, rigs and other LibreToon features may be missing or flattened in Animate.").to_owned();
+        let has_rig = !document.extras.rig.is_empty()
+            || document
+                .extras
+                .scenes
+                .iter()
+                .any(|scene| !scene.rig.is_empty())
+            || document
+                .extras
+                .symbols
+                .iter()
+                .any(|symbol| !symbol.rig.is_empty());
+        let affected = [
+            (!document.extras.media.assets.is_empty(), "Imported media"),
+            (has_rig, "Rigging"),
+            (raster, "Raster layers"),
+            (effects, "Lights and adjustment layers"),
+        ];
+        for (present, label) in affected {
+            if present {
+                description.push_str(&format!(
+                    "
+• {}",
+                    tr(label)
+                ));
+            }
+        }
         if rfd::MessageDialog::new()
             .set_title(tr("Export Adobe Animate (.fla)…"))
-            .set_description(tr("The FLA preview preserves compatible vector artwork and timing. Media, rigs and other LibreToon features may be missing or flattened in Animate."))
+            .set_description(&description)
             .set_buttons(rfd::MessageButtons::OkCancel)
-            .show() != rfd::MessageDialogResult::Ok
+            .show()
+            != rfd::MessageDialogResult::Ok
         {
             return;
         }
@@ -396,12 +461,13 @@ impl Editor {
             return;
         }
         let record = &self.hub.tabs[index].record;
-        let mut doc = self.project_document();
+        let mut doc = document;
         doc.extras.imported = false;
         crate::raster::prune(&mut doc);
         let expected = stamp(&path);
         let (send, result) = mpsc::channel();
         self.project_save.job = Some(Job {
+            target: path.clone(),
             result,
             recovery: record.recovery.clone(),
             revision: record.revision,
@@ -460,7 +526,23 @@ impl Editor {
                     }
                     Err(SaveError::Failed(error)) => {
                         self.project_save.update_save = None;
-                        self.status = error;
+                        self.status = error.clone();
+                        let mut details = format!(
+                            "{error}
+
+{} {}",
+                            tr("Destination"),
+                            job.target.display()
+                        );
+                        if !job.interchange && job.recovery.exists() {
+                            details.push_str(&format!(
+                                "
+{} {}",
+                                tr("Recovery file"),
+                                job.recovery.display()
+                            ));
+                        }
+                        self.project_save.error = Some(details);
                     }
                 }
             } else {
@@ -472,6 +554,15 @@ impl Editor {
             let mut cancel = false;
             egui::Modal::new(egui::Id::unique("project-save-conflict")).show(ctx, |ui| {
                 ui.heading(tr("El archivo cambió en disco"));
+                if let Some(path) = self
+                    .hub
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.record.recovery == recovery)
+                    .and_then(|tab| tab.record.path.as_ref())
+                {
+                    ui.label(path.display().to_string());
+                }
                 ui.label(tr(
                     "Guarda tu trabajo en una copia para conservar la versión del disco.",
                 ));
@@ -498,6 +589,18 @@ impl Editor {
             }
             if copy || cancel {
                 self.project_save.conflict = None;
+            }
+            return;
+        }
+        if let Some(error) = &self.project_save.error {
+            let mut dismiss = false;
+            egui::Modal::new(egui::Id::unique("project-save-error")).show(ctx, |ui| {
+                ui.heading(tr("Could not save the project"));
+                ui.label(error);
+                dismiss = ui.button(tr("Aceptar")).clicked();
+            });
+            if dismiss {
+                self.project_save.error = None;
             }
             return;
         }
@@ -549,7 +652,6 @@ impl Editor {
             || self.hub.closing.is_some()
             || self.updater.install_pending
             || self.references.importing()
-            || self.canvas.can_undo_pen()
             || ctx.input(|i| i.pointer.any_down())
         {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -581,6 +683,28 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_saves_use_published_metadata_and_recreate_a_missing_target() {
+        let dir =
+            std::env::temp_dir().join(format!("libretoon-repeat-save-{}", crate::features::id()));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("animation.ltoon");
+        let mut doc = crate::fresh_document();
+        let mut expected = None;
+        for fps in [24, 25, 30, 48] {
+            doc.fps = fps;
+            let (_, saved) = write_snapshot(&doc, &target, expected, false).unwrap();
+            assert!(stamp(&target) == Some(saved));
+            expected = Some(saved);
+        }
+        fs::remove_file(&target).unwrap();
+        doc.fps = 60;
+        let (_, recreated) = write_snapshot(&doc, &target, expected, false).unwrap();
+        assert!(stamp(&target) == Some(recreated));
+        assert_eq!(crate::documents::read_project(&target).unwrap().fps, 60);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn saving_preserves_external_edits_and_creates_numbered_versions() {

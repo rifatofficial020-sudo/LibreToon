@@ -53,7 +53,7 @@ El primer benchmark conserva el cálculo original para comparar y verifica igual
 
 Validación realizada: 27 regresiones superadas tanto en desarrollo como en `release`, y los 2 benchmarks manuales superados en `release`; comprobación de formato Rust y sintaxis de PowerShell. El ejecutable de desarrollo permaneció abierto ocho segundos sin errores de arranque con una recuperación temporal aislada. Esta comprobación no sustituye una sesión de dibujo manual.
 
-Los lanzadores normales abren `target/release/libretoon.exe`; `Desarrollar.cmd` conserva el ciclo rápido de compilación de desarrollo. Al guardar código, el reinicio del editor permite el cierre normal para que termine la recuperación pendiente.
+El lanzador normal abre `target/release/libretoon.exe`. [Desarrollar.cmd](scripts/dev/Desarrollar.cmd) conserva el ciclo rápido de compilación de desarrollo. Al guardar código, el reinicio del editor permite el cierre normal para que termine la recuperación pendiente.
 
 
 ## Iteración de dibujo vectorial
@@ -189,7 +189,7 @@ Medición sintética en este entorno Linux x86_64 (AMD EPYC 9V74, tres CPU visib
 | Base `fdc32ee` | 59,79551 ms |
 | Validación con deduplicación y controles nuevos | 0,60235 ms |
 
-Comando: `cargo test --release --locked benchmark_audit_shared_validation -- --ignored --nocapture`. Mide CPU de validación, no lectura, renderizado, latencia de entrada ni FPS. No constituye una comparación con Animate. Los costes pendientes y la matriz de compatibilidad están en `AUDIT.md`.
+Comando: `cargo test --release --locked benchmark_audit_shared_validation -- --ignored --nocapture`. Mide CPU de validación, no lectura, renderizado, latencia de entrada ni FPS. No constituye una comparación con Animate. Los costes pendientes y la matriz de compatibilidad están en [la auditoría de importación](docs/AUDIT.md).
 
 ## Temas e idiomas (noviembre de 2026)
 
@@ -265,3 +265,25 @@ El recorte calcula intersecciones al cambiar de contorno objetivo o invalidarse 
 
 ## Clave automática al pintar
 El conmutador A, desactivado inicialmente y guardado en preferencias, crea una clave en el fotograma actual al confirmar un trazo sobre una exposición. Conserva la pose existente con datos compartidos y usa la misma entrada de historial del trazo. No inserta fotogramas, no desplaza claves y no avanza el cabezal. Si ya existe una clave, la reutiliza. El estado desactivado conserva la edición habitual de la exposición completa.
+
+## Caché de previsualización de composición
+
+La vista conserva hasta 32 texturas de fotogramas, con un presupuesto de 96 MiB para la caché. En pausa, prepara hasta 12 fotogramas siguientes según la memoria disponible, con una sola tarea activa y prioridad para el cabezal. Los proyectos con pistas de vídeo usan la ruta de decodificación bajo demanda. Las claves distinguen el tiempo de los símbolos independientes, la resolución y la generación del documento. Una edición invalida las texturas de la generación anterior.
+
+Medición local en Windows x64, perfil release, con los dos primeros fotogramas de DBGT-Rebuild-v1 a 1920 × 1080 y las luces activas. Preparar ambos llevó 3,07 s. Alternar entre sus texturas 100 veces llevó 0,42 ms de CPU en la prueba de interfaz, sin renderizados ni subidas de textura durante esa fase. No mide FPS en una ventana real, latencia de presentación ni el coste de fotogramas que aún no están en caché.
+
+Para repetirla, establece la variable `LIBRETOON_BENCHMARK_PROJECT` con la ruta del proyecto y ejecuta `cargo test --release --locked benchmark_dbgt_preview_cache -- --ignored --nocapture`.
+
+## Segunda iteración de rendimiento
+
+La preparación manual usa la vista de reproducción y admite la escena o la etiqueta activa. El límite de caché de fotogramas RGB en RAM es configurable entre 128 y 1024 MiB, con 256 MiB por defecto. Las texturas de fotogramas tienen un presupuesto separado de 96 MiB. Preparar una escena con pistas de vídeo queda fuera de esta ruta. El compositor conserva cachés acotadas de imágenes base, normales de relieve dependientes de alfa y prefijos de ajustes. Los relieves con mapa de altura o dependientes del color se recalculan. La selección y el bote descartan candidatos por sus límites antes de comprobar el contorno.
+
+El escritor nativo produce el ZIP directamente sobre el temporal, comprime más los metadatos y las teselas raster, y evita el intento de serialización antigua cuando las exposiciones ya superan el umbral por un límite inferior. La recuperación reutiliza la compresión de recursos idénticos y publica instantáneas completas. El cargador en segundo plano también restaura las pestañas sin sesión en memoria.
+
+Mediciones locales en Windows x64, perfil release, con DBGT-Rebuild-v1. Los primeros dos fotogramas Full HD se prepararon en 2,07 s frente a 3,07 s en la medición anterior. Los últimos cuatro tardaron 9,22 s con reutilización entre fotogramas frente a 11,95 s en la revisión anterior. El primer plano coincidió píxel a píxel con el PNG de referencia y los últimos cuatro coincidieron con renderizados sin caché previa. Los tiempos corresponden a ejecuciones individuales y no incluyen FPS de una ventana real.
+
+El proyecto pasó de 4.849.126 a 4.084.613 bytes y reabrió con los fotogramas y los recursos comprobados. Abrir y validar llevó 83 ms. Serializar y comprimir en memoria llevó 369 ms. Repetir la recuperación con la compresión de recursos ya preparada llevó 178 ms. Esas dos últimas cifras excluyen el tiempo de escritura y sincronización de disco.
+
+El prototipo WGPU de desenfoque de lente procesó una imagen sintética Full HD con 48 muestras. En una RTX 2060, CPU tardó 68,2 ms y GPU 11,4 ms con transferencias. La salida RGBA coincidió byte a byte. La integración interactiva en distintos adaptadores queda pendiente. Un ensayo de decodificación secuencial de vídeo con cadencia variable difirió de la búsqueda por fotograma en ocho de doce muestras con remuestreo fijo y en una de doce al seleccionar por PTS. La vista de vídeo reutiliza fotogramas ya decodificados y conserva la búsqueda original cuando falta una muestra.
+
+Pruebas manuales: `benchmark_dbgt_preview_cache` y `benchmark_dbgt_storage` con `LIBRETOON_BENCHMARK_PROJECT`, `benchmark_lit_camera_cache` con `LIBRETOON_CAMERA_FIXTURE` y una referencia PNG opcional en `LIBRETOON_REFERENCE_FRAME`, y `benchmark_gpu_lens_parity` para el ensayo de GPU. Ejecutar con `cargo test --release --locked <prueba> -- --ignored --nocapture`.

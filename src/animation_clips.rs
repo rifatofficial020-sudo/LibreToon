@@ -463,6 +463,7 @@ impl Editor {
             layers,
             rig,
             library_folder: None,
+            mouth_poses: Default::default(),
             folders: Default::default(),
             perspective: self.doc.extras.perspective.clone(),
         });
@@ -805,7 +806,104 @@ impl Editor {
             self.clips.delete_asset = None;
         }
     }
+    fn saved_rig_poses_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.feature.symbol_stack.is_empty() {
+            return;
+        }
+        let frame = self.group_rig_frame();
+        let rig = &self.doc.extras.rig;
+        let mut apply = None;
+        let mut remove = None;
+        let mut save = None;
+        egui::CollapsingHeader::new(tr("Rig poses")).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let draft_id = ui.scope_id().with("rig-pose-name");
+                let mut name = ui
+                    .data(|data| data.get_temp::<String>(draft_id))
+                    .unwrap_or_default();
+                ui.add(
+                    egui::TextEdit::singleline(&mut name)
+                        .char_limit(64)
+                        .hint_text(tr("Pose name")),
+                );
+                if button(
+                    ui,
+                    Icon::Save,
+                    "",
+                    "Save current rig pose",
+                    false,
+                    !name.trim().is_empty()
+                        && !rig.bones.is_empty()
+                        && self.doc.extras.rig_poses.len() < 100,
+                )
+                .clicked()
+                {
+                    save = Some(crate::rig::SavedPose {
+                        name: name.trim().to_owned(),
+                        bones: rig
+                            .bones
+                            .iter()
+                            .map(|bone| (bone.id, crate::rig::bone_value(bone, frame)))
+                            .collect(),
+                    });
+                    name.clear();
+                }
+                ui.data_mut(|data| data.insert_temp(draft_id, name));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(120.)
+                .show(ui, |ui| {
+                    for (index, pose) in self.doc.extras.rig_poses.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let compatible = !pose.bones.is_empty()
+                                && pose
+                                    .bones
+                                    .iter()
+                                    .all(|(id, _)| rig.bones.iter().any(|bone| bone.id == *id));
+                            if button(
+                                ui,
+                                Icon::Play,
+                                &pose.name,
+                                "Apply pose at playhead",
+                                false,
+                                compatible,
+                            )
+                            .clicked()
+                            {
+                                apply = Some(index);
+                            }
+                            if button(ui, Icon::Trash, "", "Delete saved pose", false, true)
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        });
+                    }
+                });
+        });
+        if let Some(pose) = save {
+            self.checkpoint();
+            self.doc.extras.rig_poses.push(pose);
+            self.recover();
+        }
+        if let Some(index) = apply {
+            let mut pose = self.doc.extras.rig_poses[index].clone();
+            self.checkpoint();
+            for (id, key) in &mut pose.bones {
+                key.frame = frame;
+                self.doc.extras.rig.set_bone_key(*id, key.clone());
+            }
+            self.recover();
+        }
+        if let Some(index) = remove {
+            self.checkpoint();
+            self.doc.extras.rig_poses.remove(index);
+            self.recover();
+        }
+    }
+
     pub(crate) fn animation_manager_ui(&mut self, ui: &mut egui::Ui) {
+        self.saved_rig_poses_ui(ui);
         if ui.rect_contains_pointer(ui.max_rect())
             && !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
@@ -2208,6 +2306,7 @@ mod tests {
             colors: 256,
             dither: false,
             svg_sequence: false,
+            sheet: Default::default(),
         };
         crate::exporter::run_export(
             &restored,

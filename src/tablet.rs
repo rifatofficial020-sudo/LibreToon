@@ -5,6 +5,7 @@ pub struct PenInput {
     pressure: Option<f32>,
     eraser: bool,
     touch_until: f64,
+    source: Option<&'static str>,
     #[cfg(windows)]
     native: native::Wintab,
     #[cfg(target_os = "linux")]
@@ -36,6 +37,7 @@ impl PenInput {
             }
             (contact, touch_sample)
         });
+        self.source = self.pressure.map(|_| "Pointer events");
         #[cfg(windows)]
         {
             let wintab = self.native.poll();
@@ -43,7 +45,15 @@ impl PenInput {
             self.eraser =
                 native::ink_eraser().unwrap_or(self.native.eraser && wintab.is_some()) && contact;
             if contact {
-                self.pressure = ink.or(touch_sample).or(self.pressure).or(wintab);
+                let pointer = touch_sample.or(self.pressure);
+                self.pressure = ink.or(pointer).or(wintab);
+                self.source = if ink.is_some() {
+                    Some("Windows Ink")
+                } else if pointer.is_some() {
+                    Some("Pointer events")
+                } else {
+                    wintab.map(|_| "WinTab")
+                };
             }
         }
         #[cfg(target_os = "macos")]
@@ -52,6 +62,9 @@ impl PenInput {
             self.eraser = eraser && contact;
             if contact && touch_sample.is_none() {
                 self.pressure = pressure.or(self.pressure);
+                if pressure.is_some() {
+                    self.source = Some("AppKit");
+                }
             }
         }
         #[cfg(target_os = "linux")]
@@ -62,11 +75,16 @@ impl PenInput {
                 let pressure = self.x11.pressure();
                 if touch_sample.is_none() && self.pressure.is_none() {
                     self.pressure = pressure;
+                    self.source = pressure.map(|_| "XInput");
                 }
             }
             self.eraser = contact && self.x11.eraser;
         }
     }
+    pub(crate) fn source(&self) -> Option<&'static str> {
+        self.source
+    }
+
     pub fn eraser(&self) -> bool {
         self.eraser
     }

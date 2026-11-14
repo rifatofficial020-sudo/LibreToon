@@ -8,6 +8,51 @@ use crate::{
     vector,
 };
 use eframe::egui::{self, Pos2, Rect, Vec2};
+
+#[test]
+fn character_turn_channels_compose_with_bone_keys_and_round_trip() {
+    let mut rig = Rig::default();
+    rig.bones.push(bone(1, None, [0., 0.], [10., 0.]));
+    rig.bones.push(bone(2, Some(1), [10., 0.], [20., 0.]));
+    rig.set_bone_key(
+        2,
+        BoneKey {
+            angle: 0.2,
+            ..Default::default()
+        },
+    );
+    let pose = |body, head| {
+        std::sync::Arc::new(SavedPose {
+            name: "View".into(),
+            bones: [(1, body), (2, head)]
+                .map(|(id, angle)| {
+                    (
+                        id,
+                        BoneKey {
+                            angle,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .into(),
+        })
+    };
+    rig.character_turns.body.root = Some(1);
+    rig.character_turns.head.root = Some(2);
+    rig.character_turns.body.views[2] = Some(pose(0., 0.));
+    rig.character_turns.body.views[3] = Some(pose(0.4, 1.5));
+    rig.character_turns.head.views[2] = Some(pose(0., 0.));
+    rig.character_turns.head.views[3] = Some(pose(0., -0.3));
+    rig.character_turns.body.set(10, 1.);
+    rig.character_turns.head.set(5, 1.);
+    let saved = serde_json::to_vec(&rig).unwrap();
+    let loaded: Rig = serde_json::from_slice(&saved).unwrap();
+    loaded.validate().unwrap();
+    let poses = loaded.poses(5);
+    assert!((poses[&1].angle - 0.2).abs() < 1e-5);
+    assert!((poses[&2].angle - 0.1).abs() < 1e-5);
+    assert!((bone_value(&loaded.bones[1], 5).angle - 0.2).abs() < 1e-5);
+}
 fn editor() -> Editor {
     let mut e = Editor::new(&eframe::CreationContext::_new_kittest(
         egui::Context::default(),
@@ -45,6 +90,7 @@ fn symbol(id: u64, marks: Vec<Mark>) -> Symbol {
         perspective: Default::default(),
         rig: Default::default(),
         library_folder: None,
+        mouth_poses: Default::default(),
     }
 }
 fn instance(id: u64, track: u64) -> Mark {
@@ -528,7 +574,7 @@ fn pointer_gestures_create_pose_and_move_puppet_pins() {
                 ..Default::default()
             },
             |ui| {
-                e.rig_input(ui, ui.max_rect(), view);
+                e.rig_input(ui, ui.max_rect(), view, &[]);
             },
         );
         out.textures_delta.clear();
@@ -837,6 +883,7 @@ fn folder_split_relocation_preserves_rigged_poses_and_source_key_editing() {
         parent: None,
         collapsed: false,
         transform: Default::default(),
+        timeline_slot: None,
         range: None,
         source_shift: 0,
     });

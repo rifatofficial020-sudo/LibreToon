@@ -168,8 +168,14 @@ pub struct Preferences {
     pub language: Option<crate::i18n::Language>,
     pub theme: crate::themes::Theme,
     pub auto_key_paint: bool,
+    pub(crate) preview_cache_mib: usize,
+    pub(crate) viewport_quality: crate::depth::ViewportQuality,
     pub saving: crate::project_save::Options,
     pub raster_brush: crate::raster::Brush,
+    pub(crate) light_presets: Vec<crate::light::Preset>,
+    pub(crate) export_presets: Vec<crate::exporter::Preset>,
+    pub(crate) favorite_colors: Vec<[u8; 4]>,
+    pub(crate) color_preset: usize,
     layer_colors: [[u8; 3]; 9],
     pub bindings: Vec<Binding>,
     pub actions: Vec<Binding>,
@@ -202,8 +208,14 @@ impl Default for Preferences {
             language: None,
             theme: Default::default(),
             auto_key_paint: false,
+            preview_cache_mib: 256,
+            viewport_quality: Default::default(),
             saving: Default::default(),
             raster_brush: Default::default(),
+            light_presets: Vec::new(),
+            export_presets: Vec::new(),
+            favorite_colors: Vec::new(),
+            color_preset: 0,
             layer_colors: LayerColor::ALL.map(|(_, _, _, color)| color),
             bindings: TOOLS
                 .iter()
@@ -220,8 +232,12 @@ pub struct Studio {
     pub prefs: Preferences,
     pub preferences_open: bool,
     pub credits_open: bool,
+    pub(crate) palette: crate::palette::Panel,
     preference_category: usize,
     pub stage_only: bool,
+    pub(crate) layer_objects_open: bool,
+    pub(crate) command_helper: bool,
+    pub(crate) color_picker: Option<bool>,
     pub onion_before: usize,
     pub onion_after: usize,
     pub clipboard: Vec<Mark>,
@@ -242,6 +258,9 @@ pub struct Studio {
     pub export: Option<crate::exporter::ExportSettings>,
     pub ffmpeg_setup: crate::ffmpeg_setup::Setup,
     pub export_job: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    pub(crate) export_batch: crate::exporter::ExportBatch,
+    pub(crate) export_batch_total: usize,
+    pub(crate) export_batch_index: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub export_progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub export_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     notice: String,
@@ -286,8 +305,12 @@ impl Studio {
             prefs,
             preferences_open: false,
             credits_open: false,
+            palette: Default::default(),
             preference_category: 0,
             stage_only: false,
+            layer_objects_open: false,
+            command_helper: false,
+            color_picker: None,
             onion_before: 1,
             onion_after: 1,
             clipboard: vec![],
@@ -308,6 +331,9 @@ impl Studio {
             export: None,
             ffmpeg_setup: Default::default(),
             export_job: None,
+            export_batch: Default::default(),
+            export_batch_total: 1,
+            export_batch_index: Default::default(),
             export_progress: Default::default(),
             export_cancel: Default::default(),
             notice: String::new(),
@@ -545,29 +571,164 @@ impl Editor {
             || self.animation.picker.is_some()
             || self.studio.preferences_open
             || self.studio.export.is_some()
+            || self.document_settings.is_some()
             || self.view_options.draft.is_some()
             || self.folder_groups.dialog.is_some()
         {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)) {
+        // egui-winit delivers native clipboard events for these shortcuts.
+        let (mut copy, mut cut, mut paste) = (false, false, false);
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                match event {
+                    egui::Event::Copy => copy = true,
+                    egui::Event::Cut => cut = true,
+                    egui::Event::Paste(_) | egui::Event::PasteImage(_) => paste = true,
+                    _ => return true,
+                }
+                false
+            });
+            copy |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::C);
+            cut |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::X);
+            paste |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::V);
+        });
+        if copy {
             if self.frame_clipboard.focus {
-                self.copy_timeline_frames();
+                self.copy_frames_to_clipboard(ctx);
             } else {
-                self.copy_selection(false);
+                self.copy_canvas_to_clipboard(ctx, false);
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::X)) {
-            self.copy_selection(true);
+        if cut {
+            self.copy_canvas_to_clipboard(ctx, true);
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)) {
+        if paste {
             if self.frame_clipboard.focus && self.frame_clipboard.has_frames() {
                 self.paste_timeline_frames();
-            } else if !self.paste_media_image() {
-                self.paste_selection();
+            } else {
+                self.paste_canvas_clipboard();
             }
         }
     }
+    pub(crate) fn command_helper_ui(&self, ui: &mut egui::Ui, area: egui::Rect) {
+        if !self.studio.command_helper {
+            return;
+        }
+        let tool = self.tool;
+        let tr = crate::i18n::tr;
+        let command = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        let modifiers: &[(&str, &str)] = match tool {
+            Tool::Bones if self.rigging.paint => &[
+                ("Drag", "Paint bone weights"),
+                ("{cmd} + drag", "Remove bone weights"),
+                ("Shift + drag", "Smooth bone weights"),
+            ],
+            Tool::Bones => &[
+                ("Shift + drag", "Move bone anchor"),
+                ("Alt + drag", "Scale bone"),
+                ("{cmd} + drag", "Stretch or squash bone"),
+                ("{cmd} + Shift + drag", "Move bone pose"),
+            ],
+            Tool::Puppet => &[("Shift + drag", "Move pin anchor")],
+            Tool::Select | Tool::Object => &[
+                ("Shift + click", "Add or remove from selection"),
+                ("Shift + drag", "Move along one axis"),
+                ("Double-click a stroke", "Select connected strokes"),
+                ("Double-click a symbol", "Edit symbol"),
+                ("{cmd} + C / X / V", "Copy / Cut / Paste"),
+            ],
+            Tool::Lasso | Tool::PolygonSelect | Tool::Wand => &[("Shift", "Add to selection")],
+            Tool::Rectangle | Tool::Ellipse | Tool::Polygon | Tool::Line => &[
+                ("Shift + drag", "Constrain proportions or angle"),
+                ("Alt + drag", "Ignore snapping"),
+            ],
+            Tool::Pen => &[
+                ("Click / drag", "Create a corner / curve"),
+                ("Shift + drag", "Snap new tangent to 45°"),
+                ("Alt + click an anchor", "Convert anchor to a corner"),
+                ("Alt + drag", "Edit one handle independently"),
+                ("Click first anchor", "Close path"),
+                ("Enter / Esc", "Finish / cancel path"),
+                ("Delete", "Delete selected anchor"),
+            ],
+            Tool::Node => &[
+                ("Alt + click an anchor", "Convert anchor to a corner"),
+                ("Alt + drag", "Edit one handle independently"),
+                ("Delete", "Delete selected anchor"),
+            ],
+            Tool::Zoom => &[("Alt + click", "Reverse zoom direction")],
+            Tool::Transform => &[
+                ("Shift + drag object", "Move along one axis"),
+                ("Shift + drag corner", "Keep proportions"),
+                ("Shift + drag rotation handle", "Snap rotation to 15°"),
+                ("Alt + drag", "Ignore snapping"),
+                ("{cmd} + C / X / V", "Copy / Cut / Paste"),
+            ],
+            Tool::Brush if self.doc.layers[self.layer].options.light_mask => &[
+                ("Click or drag", "Paint light mask"),
+                ("{cmd} + click or drag", "Remove from light mask"),
+            ],
+            _ => &[],
+        };
+        let shortcut = TOOLS
+            .iter()
+            .position(|&candidate| candidate == tool)
+            .and_then(|index| self.studio.prefs.bindings.get(index))
+            .map(Binding::label)
+            .unwrap_or_default();
+        egui::Area::new(egui::Id::unique("tool-command-helper"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(area.right_bottom() - egui::vec2(8., 8.))
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(tool.name());
+                        if !shortcut.is_empty() {
+                            ui.label(egui::RichText::new(shortcut).monospace().weak());
+                        }
+                    });
+                    for (gesture, action) in modifiers {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(tr(gesture).replace("{cmd}", command))
+                                    .monospace(),
+                            );
+                            ui.small(tr(action));
+                        });
+                    }
+                    ui.small(tr("Middle mouse drag · Pan canvas"));
+                });
+            });
+    }
+
+    pub(crate) fn copy_frames_to_clipboard(&mut self, ctx: &egui::Context) {
+        if self.copy_timeline_frames() {
+            ctx.copy_text("LibreToon frames".to_owned());
+        }
+    }
+
+    pub(crate) fn copy_canvas_to_clipboard(&mut self, ctx: &egui::Context, cut: bool) {
+        if !self.canvas.selected.is_empty() {
+            self.copy_selection(cut);
+            if !self.studio.clipboard.is_empty() {
+                ctx.copy_text("LibreToon artwork".to_owned());
+            }
+        }
+    }
+
+    pub(crate) fn paste_canvas_clipboard(&mut self) {
+        if !self.paste_media_image() {
+            self.paste_selection();
+        }
+    }
+
     pub fn copy_selection(&mut self, cut: bool) {
         let mut ids = self.canvas.selected.clone();
         ids.sort_unstable();
@@ -577,23 +738,31 @@ impl Editor {
         }
         self.frame_clipboard.clear();
         self.studio.clipboard_symbols = self.doc.extras.symbols.clone();
-        self.studio.clipboard = ids
-            .iter()
-            .filter_map(|&(l, m)| {
-                self.doc
-                    .layers
-                    .get(l)?
-                    .frames
-                    .get(self.frame)?
-                    .get(m)
-                    .cloned()
-            })
-            .collect();
+        self.studio.clipboard.clear();
+        for &(l, m) in &ids {
+            if let Some((_, inside)) = self.canvas.partial.get(&(l, m)) {
+                self.studio.clipboard.extend(inside.iter().cloned());
+            } else if let Some(mark) = self
+                .doc
+                .layers
+                .get(l)
+                .and_then(|layer| layer.frames.get(self.frame))
+                .and_then(|marks| marks.get(m))
+            {
+                self.studio.clipboard.push(mark.clone());
+            }
+        }
         if cut {
+            let mut state = std::mem::take(&mut self.canvas);
             self.checkpoint();
+            self.materialize_fragments(&mut state);
+            ids = state.selected.clone();
+            ids.sort_unstable();
             for (l, m) in ids.into_iter().rev() {
                 self.doc.layers[l].frames[self.frame].remove(m);
             }
+            state.clear_selection();
+            self.canvas = state;
             self.recover();
         }
     }
@@ -1156,7 +1325,7 @@ impl Editor {
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(Vec2::new(155.,560.),egui::Layout::top_down(egui::Align::Min),|ui|{
                         ui.add_space(8.);
-                        for (index,label,icon) in [(0,"Interfaz",crate::design::Icon::Settings),(1,"Atajos de teclado",crate::design::Icon::Node),(2,"Opciones de guardado",crate::design::Icon::Save),(3,"Layer colors",crate::design::Icon::Layers)] {
+                        for (index,label,icon) in [(0,"Interfaz",crate::design::Icon::Settings),(1,"Atajos de teclado",crate::design::Icon::Node),(2,"Opciones de guardado",crate::design::Icon::Save),(3,"Layer colors",crate::design::Icon::Layers),(4,"Performance",crate::design::Icon::Zoom),(5,"Tablet diagnostics",crate::design::Icon::Pen)] {
                             if crate::design::button(ui,icon,label,label,self.studio.preference_category==index,true).clicked(){self.studio.preference_category=index;self.studio.capture=None;}
                         }
                     });
@@ -1170,6 +1339,29 @@ impl Editor {
                                 ui.label(tr("Idioma"));let mut locale=self.studio.prefs.locale();egui::ComboBox::from_id_salt("language").selected_text(locale.name()).show_ui(ui,|ui|{for language in crate::i18n::Language::ALL{if ui.selectable_value(&mut locale,language,language.name()).changed(){self.studio.prefs.language=Some(locale);save=true;}}});ui.end_row();
 
                             });
+                        } else if self.studio.preference_category == 5 {
+                            ui.heading(tr("Tablet diagnostics"));
+                            let pen = &self.drawing.pen;
+                            ui.label(tr("Press the pen on this window to test pressure and the eraser."));
+                            ui.label(format!("{} · {}", tr("Input source"), pen.source().unwrap_or(tr("Waiting for pen"))));
+                            let force = pen.force().unwrap_or(0.);
+                            ui.add(egui::ProgressBar::new(force).text(format!("{} · {:.0}%", tr("Pressure"), force * 100.)));
+                            ui.label(if pen.eraser() { tr("Eraser tip") } else { tr("Pen tip") });
+                            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                        } else if self.studio.preference_category == 4 {
+                            ui.heading(tr("Performance"));
+                            ui.add_space(12.);
+                            ui.horizontal(|ui| {
+                                ui.label(tr("Preview cache memory"));
+                                let memory = &mut self.studio.prefs.preview_cache_mib;
+                                egui::ComboBox::from_id_salt("preview-cache-memory").selected_text(format!("{memory} MiB")).show_ui(ui, |ui| {
+                                    for size in [128, 256, 512, 1024] {
+                                        save |= ui.selectable_value(memory, size, format!("{size} MiB")).changed();
+                                    }
+                                });
+                            });
+                            let (used, count) = self.depth.cache_usage();
+                            ui.label(format!("{:.1} MiB · {} {}", used as f64 / 1048576., count, tr("Cached frames")));
                         } else if self.studio.preference_category == 2 {
                             ui.heading(tr("Opciones de guardado"));
                             ui.add_space(12.);

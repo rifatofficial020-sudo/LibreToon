@@ -232,6 +232,101 @@ pub fn optics_ui(ui: &mut egui::Ui, optics: &mut Optics) -> bool {
     ));
     changed
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ViewportQuality {
+    #[default]
+    Full,
+    Half,
+    Quarter,
+    Eighth,
+}
+impl ViewportQuality {
+    pub const ALL: [Self; 4] = [Self::Eighth, Self::Quarter, Self::Half, Self::Full];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full quality",
+            Self::Half => "1/2",
+            Self::Quarter => "1/4",
+            Self::Eighth => "1/8",
+        }
+    }
+    fn factor(self) -> f32 {
+        match self {
+            Self::Full => 1.,
+            Self::Half => 0.5,
+            Self::Quarter => 0.25,
+            Self::Eighth => 0.125,
+        }
+    }
+}
+
+const PREVIEW_TEXTURE_BYTES: usize = 96 * 1024 * 1024;
+const PREVIEW_LOOKAHEAD: usize = 12;
+const PREVIEW_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+struct CachedPreview {
+    key: Vec<usize>,
+    pixels: Vec<u8>,
+    size: [usize; 2],
+    texture: Option<egui::TextureHandle>,
+}
+
+fn preview_identity(doc: &Document) -> [usize; 25] {
+    let mut identity = [0; 25];
+    identity[..11].copy_from_slice(&[
+        doc.layers.identity(),
+        doc.extras.cameras.identity(),
+        doc.extras.symbols.identity(),
+        doc.extras.folders.identity(),
+        doc.extras.rig.bones.identity(),
+        doc.extras.rig.bindings.identity(),
+        doc.extras.media.assets.identity(),
+        doc.extras.media.tracks.identity(),
+        doc.extras.animation_clips.identity(),
+        doc.width as usize,
+        doc.height as usize,
+    ]);
+    identity[11..].copy_from_slice(&doc.extras.rig.character_turns.identity());
+    identity
+}
+
+// Only retain a composited frame across changes to light or FX parameters.
+// Artwork, camera, visibility and other document changes use the live stage.
+fn only_compositing_changed(before: &Document, after: &Document) -> bool {
+    let previous = preview_identity(before);
+    let current = preview_identity(after);
+    if previous[1..] != current[1..]
+        || before.fps != after.fps
+        || before.layers.len() != after.layers.len()
+    {
+        return false;
+    }
+    let mut changed = false;
+    for (old, new) in before.layers.iter().zip(after.layers.iter()) {
+        if old.frames.identity() != new.frames.identity()
+            || old.visible != new.visible
+            || old.name != new.name
+            || old.options.light.is_some() != new.options.light.is_some()
+            || old.options.adjustment.is_some() != new.options.adjustment.is_some()
+        {
+            return false;
+        }
+        let (mut old, mut new) = (old.options.clone(), new.options.clone());
+        changed |= old.adjustment != new.adjustment
+            || old.adjustment_bands != new.adjustment_bands
+            || old.light != new.light;
+        for options in [&mut old, &mut new] {
+            options.adjustment = None;
+            options.adjustment_bands = None;
+            options.light = None;
+        }
+        if old != new {
+            return false;
+        }
+    }
+    changed
+}
+
 #[derive(Default)]
 pub struct DepthEditor {
     pub open: bool,
@@ -239,16 +334,239 @@ pub struct DepthEditor {
     pub preview: Option<egui::TextureHandle>,
     job: Option<std::sync::mpsc::Receiver<(Vec<usize>, Vec<u8>, [usize; 2])>>,
     requested: Vec<usize>,
+    work: Option<std::sync::Arc<PreviewWork>>,
+    gpu: Option<std::sync::Arc<crate::gpu_lens::GpuLens>>,
+    job_is_prefetch: bool,
     owner: Option<Document>,
-    preview_scope: Option<(usize, Option<u64>, u32, u32, bool, bool, bool)>,
+    render_doc: Option<Document>,
+    independent_clock: Option<bool>,
+    cached: std::collections::VecDeque<CachedPreview>,
+    prepare: Option<(usize, usize)>,
+    shown: Vec<usize>,
+    held_preview: bool,
+    interactive_job: bool,
+    focus: Option<(Vec<usize>, std::time::Instant)>,
+    preview_scope: Option<(
+        usize,
+        Option<u64>,
+        u32,
+        u32,
+        bool,
+        bool,
+        bool,
+        bool,
+        Option<usize>,
+        ViewportQuality,
+    )>,
     preview_epoch: usize,
+    render_cache: std::sync::Arc<std::sync::Mutex<crate::paint::RenderCache>>,
 }
+#[derive(Default)]
+pub(crate) struct PreviewWork {
+    canceled: std::sync::atomic::AtomicBool,
+    progress: std::sync::atomic::AtomicU8,
+    phase: std::sync::atomic::AtomicU8,
+}
+impl PreviewWork {
+    pub(crate) fn canceled(&self) -> bool {
+        self.canceled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn phase(&self, phase: u8) {
+        self.phase
+            .store(phase, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn report(&self, progress: u8) {
+        self.progress
+            .store(progress, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn preview_texture(ctx: &egui::Context, size: [usize; 2], pixels: &[u8]) -> egui::TextureHandle {
+    ctx.load_texture(
+        "composited-stage-preview",
+        egui::ColorImage::from_rgb(size, pixels),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
 impl DepthEditor {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            gpu: cc
+                .wgpu_render_state
+                .as_ref()
+                .and_then(crate::gpu_lens::GpuLens::from_renderer)
+                .map(std::sync::Arc::new),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn invalidate_preview(&mut self) {
+        self.cancel_job();
         self.preview = None;
+        self.prepare = None;
+        self.shown.clear();
+        self.held_preview = false;
+        self.interactive_job = false;
+        self.cached.clear();
+        self.focus = None;
+        self.owner = None;
+        self.render_doc = None;
+        self.independent_clock = None;
+        self.render_cache = Default::default();
         self.requested.clear();
         self.preview_scope = None;
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
+    }
+
+    fn sync_document(&mut self, doc: &Document) {
+        if self
+            .owner
+            .as_ref()
+            .is_none_or(|owner| preview_identity(owner) != preview_identity(doc))
+        {
+            let editing = self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| only_compositing_changed(owner, doc));
+            let displayed_latest = self.shown.first() == Some(&self.preview_epoch);
+            let requested_latest = self.requested.first() == Some(&self.preview_epoch);
+            self.held_preview = editing && (displayed_latest || self.held_preview);
+            self.interactive_job =
+                editing && !self.job_is_prefetch && (requested_latest || self.interactive_job);
+            if !self.interactive_job {
+                self.cancel_job();
+            }
+            self.preview_epoch = self.preview_epoch.wrapping_add(1);
+            self.cached.clear();
+
+            self.owner = Some(doc.clone());
+            self.render_doc = None;
+            self.independent_clock = None;
+            self.prepare = None;
+        }
+    }
+
+    fn cache_clock(&mut self, doc: &Document, frame: usize, playback_clock: usize) -> usize {
+        if frame == playback_clock {
+            return frame;
+        }
+        let independent = self.independent_clock.get_or_insert_with(|| {
+            // Most projects only use scene-synchronized symbols. Inspect shared
+            // cels once per revision, with a conservative fallback on large files.
+            let mut visited = std::collections::HashSet::new();
+            let mut remaining = 100_000usize;
+            let layers = doc.layers.iter().chain(
+                doc.extras
+                    .symbols
+                    .iter()
+                    .flat_map(|symbol| symbol.layers.iter()),
+            );
+            for cel in layers.flat_map(|layer| layer.frames.iter()) {
+                if remaining == 0 {
+                    return true;
+                }
+                remaining -= 1;
+                if !visited.insert(cel.identity()) {
+                    continue;
+                }
+                if cel.len() > remaining {
+                    return true;
+                }
+                remaining -= cel.len();
+                if cel.iter().any(|mark| {
+                    mark.style.instance.as_ref().is_some_and(|instance| {
+                        instance.clock == crate::features::SymbolClock::Independent
+                    })
+                }) {
+                    return true;
+                }
+            }
+            false
+        });
+        if *independent { playback_clock } else { frame }
+    }
+
+    fn cancel_job(&self) {
+        if let Some(work) = &self.work {
+            work.canceled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn cache_usage(&self) -> (usize, usize) {
+        (
+            self.cached.iter().map(|frame| frame.pixels.len()).sum(),
+            self.cached.len(),
+        )
+    }
+
+    fn trim_cache(&mut self, limit: usize) {
+        let mut bytes = self.cache_usage().0;
+        while bytes > limit {
+            let index = self
+                .cached
+                .iter()
+                .position(|entry| entry.key != self.shown)
+                .unwrap_or(0);
+            bytes -= self.cached.remove(index).unwrap().pixels.len();
+        }
+    }
+
+    fn texture_bytes(&self) -> usize {
+        self.cached
+            .iter()
+            .filter_map(|f| f.texture.as_ref())
+            .map(egui::TextureHandle::byte_size)
+            .sum()
+    }
+
+    fn trim_textures(&mut self) {
+        let mut bytes = self.texture_bytes();
+        for frame in &mut self.cached {
+            if bytes <= PREVIEW_TEXTURE_BYTES {
+                break;
+            }
+            if frame.key != self.shown
+                && let Some(texture) = frame.texture.take()
+            {
+                bytes -= texture.byte_size();
+            }
+        }
+    }
+
+    fn show_cached(&mut self, key: &[usize], ctx: &egui::Context) {
+        if self.shown == key {
+            return;
+        }
+        if let Some(index) = self.cached.iter().position(|frame| frame.key == key) {
+            let mut frame = self.cached.remove(index).unwrap();
+            let texture = frame
+                .texture
+                .get_or_insert_with(|| preview_texture(ctx, frame.size, &frame.pixels));
+            self.preview = Some(texture.clone());
+            self.shown.clone_from(&frame.key);
+            self.cached.push_back(frame);
+            self.trim_textures();
+        }
+    }
+
+    pub(crate) fn ready_frames(&self, doc: &Document) -> impl Iterator<Item = usize> + '_ {
+        let valid = self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| preview_identity(owner) == preview_identity(doc));
+        let focus = self.focus.as_ref().map(|(key, _)| key);
+        self.cached.iter().filter_map(move |cached| {
+            let key = &cached.key;
+            let current_size = focus.is_some_and(|focus| focus[3..] == key[3..]);
+            let current_clock = focus.is_some_and(|focus| {
+                focus[2].wrapping_sub(focus[1]) == key[2].wrapping_sub(key[1])
+            });
+            (valid && current_size && current_clock).then_some(key[1])
+        })
     }
 }
 
@@ -505,20 +823,8 @@ pub fn blur(pixels: Vec<u8>, w: u32, h: u32, radius: f32, optics: &Optics) -> Ve
                 ((a.cos() * r).round() as i32, (a.sin() * r).round() as i32)
             })
             .collect();
-        image::RgbaImage::from_fn(sw, sh, |x, y| {
-            let mut sum = [0u32; 4];
-            for &(dx, dy) in &offsets {
-                let xx = x as i32 + dx;
-                let yy = y as i32 + dy;
-                if xx >= 0 && yy >= 0 && xx < sw as i32 && yy < sh as i32 {
-                    let c = small.get_pixel(xx as u32, yy as u32);
-                    for k in 0..4 {
-                        sum[k] += c[k] as u32;
-                    }
-                }
-            }
-            image::Rgba(std::array::from_fn(|k| (sum[k] / samples) as u8))
-        })
+        crate::gpu_lens::blur_on_worker(&small, &offsets)
+            .unwrap_or_else(|| lens_blur(&small, &offsets))
     };
     if factor < 1. {
         image::imageops::resize(&result, w, h, image::imageops::FilterType::Triangle).into_raw()
@@ -526,7 +832,141 @@ pub fn blur(pixels: Vec<u8>, w: u32, h: u32, radius: f32, optics: &Optics) -> Ve
         result.into_raw()
     }
 }
+pub(crate) fn lens_blur(image: &image::RgbaImage, offsets: &[(i32, i32)]) -> image::RgbaImage {
+    let (w, h) = image.dimensions();
+    let stride = w as usize * 4;
+    let mut output = image::RgbaImage::new(w, h);
+    let draw = |first: usize, rows: &mut [u8]| {
+        for (index, out) in rows.chunks_exact_mut(4).enumerate() {
+            let x = (index % w as usize) as i32;
+            let y = (first + index / w as usize) as i32;
+            let mut sum = [0u32; 4];
+            for &(dx, dy) in offsets {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && xx < w as i32 && yy < h as i32 {
+                    let color = image.get_pixel(xx as u32, yy as u32);
+                    for k in 0..4 {
+                        sum[k] += u32::from(color[k]);
+                    }
+                }
+            }
+            for (dst, value) in out.iter_mut().zip(sum) {
+                *dst = (value / offsets.len() as u32) as u8;
+            }
+        }
+    };
+    let workers = if u64::from(w) * u64::from(h) * offsets.len() as u64 >= 8_000_000 {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+    } else {
+        1
+    };
+    if workers == 1 {
+        draw(0, &mut output);
+    } else {
+        let rows_per_chunk = (h as usize).div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (part, rows) in output.chunks_mut(rows_per_chunk * stride).enumerate() {
+                scope.spawn(move || draw(part * rows_per_chunk, rows));
+            }
+        });
+    }
+    output
+}
+
 impl Editor {
+    pub(crate) fn prepare_preview(&mut self, range: Option<(usize, usize)>) {
+        let last = self.doc.layers[0].frames.len() - 1;
+        let (first, end) = range.unwrap_or((0, last));
+        let range = (first.min(last), end.clamp(first.min(last), last));
+        if self.doc.extras.media.video_intersects(range.0, range.1) {
+            self.status = tr("The selected range contains video. Choose a range without video to prepare the preview.").into();
+            return;
+        }
+        self.playing = false;
+        self.restart_media_audio();
+        self.studio.stage_only = true;
+        self.frame = range.0;
+        self.depth.prepare = Some(range);
+    }
+
+    pub(crate) fn paint_preview_progress(&self, painter: &egui::Painter, area: egui::Rect) {
+        let Some(work) = self.depth.work.as_ref() else {
+            return;
+        };
+        if area.width() < 180. || area.height() < 48. {
+            return;
+        }
+        let Some(&frame) = self.depth.requested.get(1) else {
+            return;
+        };
+        let canceled = work.canceled();
+        let percent = if canceled {
+            0
+        } else {
+            work.progress.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let label = if canceled {
+            tr("Waiting to render frame")
+        } else if percent < 20 {
+            tr("Preparing artwork")
+        } else if percent < 88 {
+            match work.phase.load(std::sync::atomic::Ordering::Relaxed) {
+                1 => tr("Calculating lights"),
+                2 => tr("Applying effects"),
+                _ => tr("Compositing layers"),
+            }
+        } else {
+            tr("Finishing preview")
+        };
+        let number = if canceled { self.frame } else { frame };
+        let prepared = self
+            .depth
+            .prepare
+            .map(|(first, last)| {
+                let ready = self
+                    .depth
+                    .ready_frames(&self.doc)
+                    .filter(|f| (first..=last).contains(f))
+                    .count();
+                format!(" · {ready}/{}", last - first + 1)
+            })
+            .unwrap_or_default();
+        let text = format!("{label} {} · {percent}%{prepared}", number + 1);
+        let font = egui::FontId::proportional(11.);
+        let text_color = painter
+            .ctx()
+            .style_of(painter.ctx().theme())
+            .visuals
+            .text_color();
+        let galley = painter.layout_no_wrap(text, font, text_color);
+        let position = area.left_top() + egui::vec2(10., 10.);
+        let rect = egui::Rect::from_min_size(position, galley.size() + egui::vec2(16., 12.));
+        painter.rect_filled(rect, 4., crate::themes::color(egui::Color32::from_gray(35)));
+        painter.galley(position + egui::vec2(8., 4.), galley, text_color);
+        let start = rect.left_bottom() + egui::vec2(6., -3.);
+        painter.line_segment(
+            [
+                start,
+                start + egui::vec2((rect.width() - 12.) * f32::from(percent) / 100., 0.),
+            ],
+            egui::Stroke::new(2., crate::themes::accent()),
+        );
+        painter
+            .ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    pub(crate) fn stop_preparing_preview(&mut self) {
+        self.depth.prepare = None;
+        if self.depth.job_is_prefetch {
+            self.depth.cancel_job();
+        }
+    }
+
+    pub(crate) fn preparing_preview(&self) -> bool {
+        self.depth.prepare.is_some()
+    }
+
     pub fn camera_depth_view(&self, base: View, layer: usize) -> View {
         let base = if active(self) {
             layer_view(&self.doc, self.frame, layer, base)
@@ -543,14 +983,30 @@ impl Editor {
         )
     }
     pub fn camera_blur_preview(&mut self, painter: &egui::Painter, stage: View) -> bool {
-        let use_camera = active(self);
+        let use_camera = active(self) && !self.doc.extras.cameras.is_empty();
         let optics =
             camera(&self.doc, self.frame).map(|c| crate::animation::camera_optics(c, self.frame));
-        let blur = (use_camera || self.depth.open)
-            && !self.depth.hide_blur
-            && optics.as_ref().is_some_and(|o| o.strength > 0.);
-        let post = !self.post.hidden && self.doc.layers.iter().any(crate::post::visible_effects);
-        if !post && !blur {
+        let allow_blur = (use_camera || self.depth.open) && !self.depth.hide_blur;
+        let blur = allow_blur && optics.as_ref().is_some_and(|o| o.strength > 0.);
+        let fx = !self.post.hidden
+            && self.doc.layers.iter().any(|layer| {
+                layer.options.adjustment.is_some() && crate::post::visible_effects(layer)
+            });
+        let lights = !self.post.hide_lights
+            && self
+                .doc
+                .layers
+                .iter()
+                .any(|layer| layer.visible && layer.options.light.is_some());
+        let solo = (self.post.solo_light && self.doc.layers[self.layer].options.light.is_some())
+            .then_some(self.layer);
+        let post = fx || lights;
+        let quality = self.studio.prefs.viewport_quality;
+        let reduced = quality != ViewportQuality::Full;
+        if !post && !blur && !reduced {
+            if self.depth.prepare.take().is_some() {
+                self.status = tr("No composited preview to prepare at the current frame.").into();
+            }
             if self.depth.preview_scope.is_some() {
                 self.depth.invalidate_preview();
             }
@@ -562,15 +1018,26 @@ impl Editor {
             self.doc.width,
             self.doc.height,
             use_camera,
-            post,
-            blur,
+            fx,
+            lights,
+            allow_blur,
+            solo,
+            quality,
         );
-        if self.depth.preview_scope != Some(scope) {
+        let prepare = self.depth.prepare;
+        let scope_changed = self.depth.preview_scope != Some(scope);
+        if scope_changed {
             self.depth.invalidate_preview();
             self.depth.preview_scope = Some(scope);
         }
-        let max = if post {
-            900.
+        let longest = self.doc.width.max(self.doc.height) as f32;
+        let max = if lights {
+            // Keep the light sampling grid fixed while the user zooms the canvas.
+            longest.min(2048.)
+        } else if post || reduced {
+            let physical_zoom = stage.scale * painter.ctx().pixels_per_point();
+            let cap = 3072.;
+            ((longest * physical_zoom * 1.5 / 128.).ceil() * 128.).clamp(900., cap)
         } else {
             match optics.as_ref().map(|o| o.quality).unwrap_or_default() {
                 Quality::Low => 480.,
@@ -578,83 +1045,230 @@ impl Editor {
                 Quality::High => 1200.,
             }
         };
-        let scale = (max / self.doc.width.max(self.doc.height) as f32).min(1.);
+        let scale = if post || reduced {
+            max / longest
+        } else {
+            (max / longest).min(1.)
+        };
+        let scale = scale * quality.factor();
         let size = [
             (self.doc.width as f32 * scale).round().max(1.) as usize,
             (self.doc.height as f32 * scale).round().max(1.) as usize,
         ];
-        let video = self.depth_video_frames(use_camera || blur);
+        self.depth.sync_document(&self.doc);
+        if scope_changed {
+            self.depth.prepare = prepare;
+        }
+        let cache_limit = self.studio.prefs.preview_cache_mib.clamp(128, 1024) * 1048576;
+        self.depth.trim_cache(cache_limit);
+        let Some(video) = self.depth_video_frames(use_camera || blur) else {
+            return false;
+        };
+        let has_video = !video.is_empty();
+        let clock = if self.playing {
+            self.depth
+                .cache_clock(&self.doc, self.frame, self.animation.clock)
+        } else {
+            self.frame
+        };
+        // The scope and document identity are covered by the epoch. The frame
+        // and symbol clock can diverge during playback and must both match.
         let mut key = vec![
             self.depth.preview_epoch,
-            self.doc.layers.identity(),
-            self.doc.extras.cameras.identity(),
-            self.doc.extras.symbols.identity(),
-            self.doc.extras.folders.identity(),
-            self.doc.extras.rig.bones.identity(),
-            self.doc.extras.rig.bindings.identity(),
-            self.doc.extras.media.assets.identity(),
-            self.doc.extras.media.tracks.identity(),
-            self.doc.width as usize,
-            self.doc.height as usize,
             self.frame,
+            clock,
             size[0],
             size[1],
         ];
-        key.push(if self.playing {
-            self.animation.clock
-        } else {
-            self.frame
-        });
-        key.extend([
-            usize::from(use_camera),
-            usize::from(post),
-            usize::from(blur),
-        ]);
-        for clip in &video {
-            key.push(std::sync::Arc::as_ptr(&clip.pixels) as usize);
+        key.extend(
+            video
+                .iter()
+                .map(|clip| std::sync::Arc::as_ptr(&clip.pixels) as usize),
+        );
+        let now = std::time::Instant::now();
+        if self
+            .depth
+            .focus
+            .as_ref()
+            .is_none_or(|(focus, _)| *focus != key)
+        {
+            if (self.depth.job_is_prefetch || !self.playing)
+                && (self.depth.requested.get(1) != Some(&self.frame)
+                    || self.depth.interactive_job && self.depth.requested.get(1..) != key.get(1..))
+            {
+                self.depth.interactive_job = false;
+                self.depth.cancel_job();
+            }
+            self.depth.focus = Some((key.clone(), now));
         }
         if let Some(job) = &self.depth.job {
             match job.try_recv() {
                 Ok((done, pixels, size)) => {
-                    if done.first() == Some(&self.depth.preview_epoch) {
-                        let image = egui::ColorImage::from_rgb(size, &pixels);
-                        if let Some(texture) = &mut self.depth.preview {
-                            texture.set(image, egui::TextureOptions::LINEAR);
-                        } else {
-                            self.depth.preview = Some(painter.ctx().load_texture(
-                                "composited-stage-preview",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ));
+                    self.depth.work = None;
+                    self.depth.job_is_prefetch = false;
+                    let interactive = std::mem::take(&mut self.depth.interactive_job);
+                    // Publish intermediate results for the same shot while the
+                    // user keeps dragging. Only exact results enter the cache.
+                    if interactive
+                        && !self.playing
+                        && done != key
+                        && done.get(1..) == key.get(1..)
+                        && !pixels.is_empty()
+                    {
+                        self.depth.preview = Some(preview_texture(painter.ctx(), size, &pixels));
+                        self.depth.shown.clone_from(&done);
+                        self.depth.held_preview = true;
+                    }
+                    if done.first() == Some(&self.depth.preview_epoch) && !pixels.is_empty() {
+                        let show = done == key;
+                        let texture = (show
+                            || (!has_video
+                                && self.depth.texture_bytes() + size[0] * size[1] * 4
+                                    <= PREVIEW_TEXTURE_BYTES))
+                            .then(|| preview_texture(painter.ctx(), size, &pixels));
+                        if show {
+                            self.depth.held_preview = false;
+                            self.depth.preview = texture.clone();
+                            self.depth.shown.clone_from(&done);
+                        }
+                        if !has_video && pixels.len() <= cache_limit {
+                            self.depth.cached.retain(|frame| frame.key != done);
+                            self.depth.cached.push_back(CachedPreview {
+                                key: done,
+                                pixels,
+                                size,
+                                texture,
+                            });
+                            self.depth.trim_cache(cache_limit);
+                            self.depth.trim_textures();
                         }
                     }
                     self.depth.job = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.depth.job = None;
+                    self.depth.work = None;
+                    self.depth.job_is_prefetch = false;
                     self.depth.requested.clear();
+                    self.depth.interactive_job = false;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
-        if self.depth.job.is_none() && self.depth.requested != key {
-            let mut doc = crate::animation::scene_doc(&self.doc, self.doc.extras.active_scene);
-            doc.extras.scenes.clear();
-            self.depth.owner = Some(doc.clone());
+        self.depth.show_cached(&key, painter.ctx());
+        if self.depth.shown == key {
+            self.depth.held_preview = false;
+        }
+        let mut next = None;
+        if self.depth.job.is_none() {
+            if self.depth.shown != key {
+                next = Some((key.clone(), false));
+            } else if let Some((first, last)) =
+                self.depth.prepare.filter(|_| !self.playing && !has_video)
+            {
+                let capacity = cache_limit / (size[0] * size[1] * 3);
+                let last_fit = last.min(first + capacity.saturating_sub(1));
+                next = (first..=last_fit).find_map(|frame| {
+                    let candidate = vec![self.depth.preview_epoch, frame, frame, size[0], size[1]];
+                    (!self
+                        .depth
+                        .cached
+                        .iter()
+                        .any(|cached| cached.key == candidate))
+                    .then_some((candidate, true))
+                });
+                if next.is_none() {
+                    self.depth.prepare = None;
+                    self.status = tr(if last_fit == last {
+                        "Preview ready."
+                    } else {
+                        "Preview cache full. Increase its memory or prepare a shorter range."
+                    })
+                    .into();
+                }
+            } else if !self.playing
+                && !self.doc.extras.media.has_video_tracks()
+                && (use_camera || self.doc.extras.cameras.is_empty())
+                && (post || reduced)
+            {
+                let idle = now.duration_since(self.depth.focus.as_ref().unwrap().1);
+                let capacity = (cache_limit / (size[0] * size[1] * 3)).saturating_sub(1);
+                let end = self
+                    .loop_range()
+                    .filter(|&(start, end)| (start..=end).contains(&self.frame))
+                    .map_or(self.doc.layers[0].frames.len() - 1, |(_, end)| end);
+                let limit = end.min(self.frame + capacity.min(PREVIEW_LOOKAHEAD));
+                if self.frame < limit {
+                    if idle < PREVIEW_IDLE {
+                        painter.ctx().request_repaint_after(PREVIEW_IDLE - idle);
+                    } else {
+                        next = (self.frame + 1..=limit).find_map(|frame| {
+                            let candidate =
+                                vec![self.depth.preview_epoch, frame, frame, size[0], size[1]];
+                            (!self
+                                .depth
+                                .cached
+                                .iter()
+                                .any(|cached| cached.key == candidate))
+                            .then_some((candidate, true))
+                        });
+                    }
+                }
+            }
+        }
+        if let Some((key, prefetch)) = next {
+            let doc = self
+                .depth
+                .render_doc
+                .get_or_insert_with(|| {
+                    let mut doc =
+                        crate::animation::scene_doc(&self.doc, self.doc.extras.active_scene);
+                    if !lights || !fx || solo.is_some() {
+                        for (index, layer) in doc.layers.iter_mut().enumerate() {
+                            if !crate::post::is_adjustment(layer) {
+                                continue;
+                            }
+                            let use_light = lights
+                                && solo.is_none_or(|selected| selected == index)
+                                && layer.options.light.is_some();
+                            let use_fx = fx && layer.options.adjustment.is_some();
+                            if !use_light && !use_fx {
+                                layer.visible = false;
+                            } else {
+                                if !use_light {
+                                    layer.options.light = None;
+                                }
+                                if !use_fx {
+                                    layer.options.adjustment = None;
+                                }
+                            }
+                        }
+                    }
+                    doc
+                })
+                .clone();
             self.depth.requested = key.clone();
-            let frame = self.frame;
-            let clock = if self.playing {
-                self.animation.clock
-            } else {
-                self.frame
-            };
+            let frame = key[1];
+            let clock = key[2];
+            let render_camera = use_camera
+                || (allow_blur
+                    && camera(&doc, frame)
+                        .is_some_and(|c| crate::animation::camera_optics(c, frame).strength > 0.));
+            let work = std::sync::Arc::new(PreviewWork::default());
+            self.depth.work = Some(work.clone());
+            self.depth.job_is_prefetch = prefetch;
             let (tx, rx) = std::sync::mpsc::channel();
             self.depth.job = Some(rx);
             let ctx = painter.ctx().clone();
             let submitted = key.clone();
+            let render_cache = self.depth.render_cache.clone();
+            let gpu = self.depth.gpu.clone();
             std::thread::spawn(move || {
+                crate::gpu_lens::use_on_worker(gpu);
                 let render = egui::Context::default();
-                let mut cache = crate::paint::RenderCache::default();
+                let mut cache = render_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 let pixels = crate::exporter::raster_preview(
                     &doc,
                     frame,
@@ -664,15 +1278,20 @@ impl Editor {
                     &render,
                     &mut cache,
                     &video,
-                    use_camera || blur,
+                    render_camera,
                     post,
-                    blur,
+                    allow_blur,
+                    !reduced,
+                    Some(&work),
                 );
+                work.report(100);
                 let _ = tx.send((submitted, pixels, size));
                 ctx.request_repaint();
             });
         }
-        if !use_camera && !post {
+        let hold =
+            !self.playing && self.depth.held_preview && self.depth.shown.get(1..) == key.get(1..);
+        if (!use_camera && !post && !reduced) || (self.depth.shown != key && !hold) {
             return false;
         }
         let Some(texture) = &self.depth.preview else {
@@ -729,7 +1348,9 @@ impl Editor {
         result
     }
     pub(crate) fn depth_hit(&self, layer: usize, mark: &Mark, point: Pos2, tolerance: f32) -> bool {
-        if mark.style.raster_tile {
+        if mark.style.raster_tile
+            || !crate::features::object_visible(&self.doc.layers[layer], mark, self.frame)
+        {
             return false;
         }
         crate::folder_groups::layer_active(&self.doc, &self.doc.layers[layer], self.frame)
@@ -923,7 +1544,7 @@ mod tests {
         }
     }
     #[test]
-    fn post_preview_retains_the_last_texture_while_the_next_frame_is_pending() {
+    fn post_preview_draws_live_artwork_instead_of_the_previous_frame_while_pending() {
         let ctx = egui::Context::default();
         let mut e = Editor::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
         e.doc = doc();
@@ -948,13 +1569,270 @@ mod tests {
             let texture = e.depth.preview.as_ref().unwrap().id();
             let (_pending, receiver) = std::sync::mpsc::channel();
             e.depth.job = Some(receiver);
+            let old_work = std::sync::Arc::new(PreviewWork::default());
+            e.depth.work = Some(old_work.clone());
             e.frame = 1;
-            assert!(e.camera_blur_preview(ui.painter(), view));
+            assert!(!e.camera_blur_preview(ui.painter(), view));
             assert_eq!(e.depth.preview.as_ref().unwrap().id(), texture);
+            assert!(old_work.canceled());
+            e.frame = 2;
+            assert!(!e.camera_blur_preview(ui.painter(), view));
+            e.frame = 3;
+            assert!(!e.camera_blur_preview(ui.painter(), view));
+            drop(_pending);
+            assert!(!e.camera_blur_preview(ui.painter(), view));
+            assert_eq!(e.depth.requested[1], 3);
             e.post.hidden = true;
             assert!(!e.camera_blur_preview(ui.painter(), view));
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn compositing_edits_keep_displaying_completed_previews_while_dragging() {
+        let ctx = egui::Context::default();
+        let mut e = Editor::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        e.doc = doc();
+        e.frame = e.doc.layers[0].frames.len() - 1;
+        let mut layer = e.doc.layers[0].clone();
+        layer.options.adjustment =
+            Some(vec![crate::post::Effect::new(crate::post::Kind::Hue)].into());
+        e.doc.layers.push(layer);
+        let view = View {
+            center: Pos2::ZERO,
+            scale: 1.,
+            stage_center: Pos2::ZERO,
+            angle: 0.,
+        };
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let complete = |e: &mut Editor| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send((e.depth.requested.clone(), vec![30, 60, 90], [1, 1]))
+                    .unwrap();
+                e.depth.job = Some(rx);
+            };
+            let preview = |e: &mut Editor| e.camera_blur_preview(ui.painter(), view);
+            preview(&mut e);
+            complete(&mut e);
+            assert!(preview(&mut e));
+            let first = e.depth.preview.as_ref().unwrap().id();
+            e.doc.layers[1].options.adjustment =
+                Some(vec![crate::post::Effect::new(crate::post::Kind::Curves)].into());
+            assert!(preview(&mut e));
+            assert_eq!(e.depth.preview.as_ref().unwrap().id(), first);
+            let work = e.depth.work.as_ref().unwrap().clone();
+            complete(&mut e);
+            e.doc.layers[1].options.adjustment =
+                Some(vec![crate::post::Effect::new(crate::post::Kind::Levels)].into());
+            assert!(preview(&mut e));
+            assert!(!work.canceled());
+            assert_ne!(e.depth.preview.as_ref().unwrap().id(), first);
+            assert_ne!(e.depth.shown[0], e.depth.preview_epoch);
+            assert_eq!(e.depth.ready_frames(&e.doc).count(), 0);
+            e.doc.layers[0].frames[0].push(Mark::default());
+            assert!(!preview(&mut e));
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn composited_preview_reuses_frames_and_rejects_results_after_editing() {
+        let ctx = egui::Context::default();
+        let mut e = Editor::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        e.doc = doc();
+        e.studio.stage_only = true;
+        let mut layer = e.doc.layers[0].clone();
+        layer.options.adjustment =
+            Some(vec![crate::post::Effect::new(crate::post::Kind::Hue)].into());
+        e.doc.layers.push(layer);
+        let view = View {
+            center: Pos2::ZERO,
+            scale: 1.,
+            stage_center: Pos2::ZERO,
+            angle: 0.,
+        };
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let complete = |e: &mut Editor| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send((e.depth.requested.clone(), vec![0, 0, 0], [1, 1]))
+                    .unwrap();
+                e.depth.job = Some(rx);
+            };
+            e.camera_blur_preview(ui.painter(), view);
+            complete(&mut e);
+            e.camera_blur_preview(ui.painter(), view);
+            let first = e.depth.preview.as_ref().unwrap().id();
+            e.frame = 1;
+            e.camera_blur_preview(ui.painter(), view);
+            complete(&mut e);
+            e.camera_blur_preview(ui.painter(), view);
+            let second = e.depth.preview.as_ref().unwrap().id();
+            assert_ne!(first, second);
+
+            e.frame = 0;
+            e.camera_blur_preview(ui.painter(), view);
+            assert_eq!(e.depth.preview.as_ref().unwrap().id(), first);
+            assert!(e.depth.job.is_none());
+            assert_eq!(e.depth.ready_frames(&e.doc).count(), 2);
+
+            e.frame = e.doc.layers[0].frames.len() - 1;
+            e.animation.clock = e.frame;
+            e.playing = true;
+            e.advance_animation(1);
+            assert!(e.animation.clock > e.frame);
+            assert!(e.camera_blur_preview(ui.painter(), view));
+            assert_eq!(e.depth.preview.as_ref().unwrap().id(), first);
+            assert!(e.depth.job.is_none());
+
+            e.frame = 2;
+            e.animation.clock = 9;
+            e.camera_blur_preview(ui.painter(), view);
+            assert_eq!(e.depth.requested[2], 2);
+            complete(&mut e);
+            e.doc.layers[0].name.push('!');
+            e.camera_blur_preview(ui.painter(), view);
+            assert_eq!(e.depth.preview.as_ref().unwrap().id(), first);
+            assert_eq!(e.depth.ready_frames(&e.doc).count(), 0);
+            assert_ne!(e.depth.requested[0], e.depth.shown[0]);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn independent_symbol_uses_its_playback_clock_in_the_preview_key() {
+        let mut doc = doc();
+        let mut depth = DepthEditor::default();
+        depth.sync_document(&doc);
+        assert_eq!(depth.cache_clock(&doc, 1, 25), 1);
+        let mut mark = Mark::default();
+        mark.style.instance = Some(crate::features::Instance {
+            clock: crate::features::SymbolClock::Independent,
+            symbol: 1,
+            matrix: crate::rig::IDENTITY,
+            mode: crate::features::Playback::Loop,
+            first: 0,
+            born: 0,
+        });
+        doc.layers[0].frames[0].push(mark);
+        depth.sync_document(&doc);
+        assert_eq!(depth.cache_clock(&doc, 1, 25), 25);
+    }
+
+    #[test]
+    fn preparing_a_range_fills_earlier_and_later_frames_and_survives_play() {
+        let ctx = egui::Context::default();
+        let mut e = Editor::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        e.doc = doc();
+        let mut layer = e.doc.layers[0].clone();
+        layer.options.adjustment =
+            Some(vec![crate::post::Effect::new(crate::post::Kind::Hue)].into());
+        e.doc.layers.push(layer);
+        e.prepare_preview(Some((3, 5)));
+        let view = View {
+            center: Pos2::ZERO,
+            scale: 1.,
+            stage_center: Pos2::ZERO,
+            angle: 0.,
+        };
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for frame in 3..=5 {
+                e.camera_blur_preview(ui.painter(), view);
+                assert_eq!(e.depth.requested[1], frame);
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send((e.depth.requested.clone(), vec![0; 3], [1, 1]))
+                    .unwrap();
+                e.depth.job = Some(rx);
+            }
+            e.camera_blur_preview(ui.painter(), view);
+            assert!(!e.preparing_preview());
+            assert_eq!(e.depth.ready_frames(&e.doc).count(), 3);
+            e.playing = true;
+            e.frame = 5;
+            e.animation.clock = 5;
+            e.camera_blur_preview(ui.painter(), view);
+            assert_eq!(e.depth.shown[1], 5);
+            assert!(e.depth.job.is_none());
+            e.depth.invalidate_preview();
+            assert_eq!(e.depth.cache_usage(), (0, 0));
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_dbgt_preview_cache() {
+        let path = std::env::var_os("LIBRETOON_BENCHMARK_PROJECT")
+            .expect("Set LIBRETOON_BENCHMARK_PROJECT to DBGT-Rebuild-v1.ltoon");
+        let source = std::fs::read(path).unwrap();
+        let ctx = egui::Context::default();
+        let mut e = Editor::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        e.doc = crate::native_project::decode_if_native(&source)
+            .unwrap()
+            .unwrap();
+        e.studio.stage_only = true;
+        let full_scene = std::env::var_os("LIBRETOON_BENCHMARK_FULL_SCENE").is_some();
+        let count = e.doc.layers[0].frames.len();
+        let prepared = if full_scene {
+            e.studio.prefs.preview_cache_mib = 512;
+            e.prepare_preview(None);
+            count
+        } else {
+            e.lip.preview_range = Some((0, 1));
+            2
+        };
+        let view = View {
+            center: Pos2::ZERO,
+            scale: 1.,
+            stage_center: Pos2::ZERO,
+            angle: 0.,
+        };
+        let tick = |e: &mut Editor| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                e.camera_blur_preview(ui.painter(), view);
+            });
+            let uploads = out.textures_delta.set.len();
+            out.textures_delta.clear();
+            uploads
+        };
+        let start = std::time::Instant::now();
+        tick(&mut e);
+        while e.depth.cached.len() < prepared {
+            assert!(start.elapsed() < std::time::Duration::from_secs(300));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tick(&mut e);
+        }
+        let warmup = start.elapsed();
+        let start = std::time::Instant::now();
+        e.lip.preview_range = None;
+        e.playing = true;
+        e.frame = count - 1;
+        e.animation.clock = e.frame;
+        e.advance_animation(1);
+        tick(&mut e);
+        assert_eq!(e.depth.shown[1], 0);
+        assert!(e.depth.job.is_none());
+        if full_scene {
+            for _ in 0..2 * count {
+                e.advance_animation(1);
+                tick(&mut e);
+                assert_eq!(e.depth.shown[1], e.frame);
+                assert!(e.depth.job.is_none());
+            }
+            eprintln!(
+                "DBGT: {count} prepared frames in {warmup:?}; every frame reused across two playback loops."
+            );
+            return;
+        }
+        for i in 0..100 {
+            e.frame = i % 2;
+            e.animation.clock = e.frame;
+            assert_eq!(tick(&mut e), 0);
+            assert!(e.depth.job.is_none());
+        }
+        eprintln!(
+            "DBGT Full HD warmup {warmup:?}, 100 cached frame switches {:?} (no render jobs or uploads)",
+            start.elapsed()
+        );
     }
 
     #[test]

@@ -252,6 +252,19 @@ pub fn crossing_parts(mark: &Mark, others: &[Mark]) -> Vec<Mark> {
     parts(mark, &cuts, |_| false, true).0
 }
 /// New paint replaces covered fills; matching colors become a single region.
+fn compatible_paint_style(
+    new: &crate::features::MarkStyle,
+    old: &crate::features::MarkStyle,
+) -> bool {
+    if new == old {
+        return true;
+    }
+    let mut old = old.clone();
+    old.palette_fill = old.palette_fill.or(new.palette_fill);
+    old.palette_stroke = old.palette_stroke.or(new.palette_stroke);
+    new == &old
+}
+
 pub fn compose(existing: &[Mark], incoming: Vec<Mark>) -> Vec<Mark> {
     let mut result = existing.to_vec();
     for new in incoming {
@@ -266,12 +279,22 @@ pub fn compose(existing: &[Mark], incoming: Vec<Mark>) -> Vec<Mark> {
         let mut region = MultiPolygon(vec![vector::polygon(&new)]);
         let mut next = vec![];
         let mut touched = false;
+        let mut first_outline = None;
+        let paint_bounds = vector::control_bounds(&new);
         for old in &result {
             if old.style.instance.is_some() || old.style.text.is_some() {
                 next.push(old.clone());
                 continue;
             }
             let Some(old_color) = old.fill else {
+                if !new.stroke
+                    && old.stroke
+                    && vector::control_bounds(old)
+                        .expand(old.width)
+                        .intersects(paint_bounds)
+                {
+                    first_outline.get_or_insert(next.len());
+                }
                 next.push(old.clone());
                 continue;
             };
@@ -285,31 +308,51 @@ pub fn compose(existing: &[Mark], incoming: Vec<Mark>) -> Vec<Mark> {
                 continue;
             }
             touched = true;
-            if color == old_color && new.style == old.style {
+            if !new.style.primitive
+                && color == old_color
+                && compatible_paint_style(&new.style, &old.style)
+                && new.bucket == old.bucket
+            {
                 region = region.union(&poly);
             } else {
-                next.extend(crate::features::styled(
-                    poly.difference(&region),
-                    old_color,
-                    &old.style,
-                ));
+                next.extend(
+                    crate::features::styled(poly.difference(&region), old_color, &old.style)
+                        .into_iter()
+                        .map(|mut part| {
+                            part.bucket = old.bucket;
+                            part
+                        }),
+                );
             }
             if old.stroke {
+                if !new.stroke {
+                    first_outline.get_or_insert(next.len());
+                }
                 let mut contour = old.clone();
                 contour.fill = None;
                 next.push(contour);
             }
         }
-        if !touched {
-            next.push(new);
+        let mut paint = Vec::new();
+        if !touched || new.style.primitive {
+            paint.push(new);
         } else {
-            next.extend(crate::features::styled(region, color, &new.style));
+            paint.extend(
+                crate::features::styled(region, color, &new.style)
+                    .into_iter()
+                    .map(|mut part| {
+                        part.bucket = new.bucket;
+                        part
+                    }),
+            );
             if new.stroke {
                 let mut contour = new;
                 contour.fill = None;
-                next.push(contour);
+                paint.push(contour);
             }
         }
+        let position = first_outline.unwrap_or(next.len());
+        next.splice(position..position, paint);
         result = next;
     }
     result
@@ -422,6 +465,29 @@ mod tests {
                 .abs()
                 < 0.1
         );
+    }
+    #[test]
+    fn hand_painted_fill_keeps_crossed_line_art_above_it() {
+        let outline = Mark {
+            points: vec![[20., -10.], [20., 110.]].into(),
+            color: [0, 0, 0, 255],
+            ..Default::default()
+        };
+        let fill = rect(0., [40, 100, 200, 255]);
+        let marks = compose(&[outline.clone()], vec![fill.clone()]);
+        assert!(marks[0] == fill);
+        assert!(marks[1] == outline);
+    }
+    #[test]
+    fn overlapping_primitive_keeps_its_fill_and_closed_stroke_in_one_mark() {
+        let mut shape = rect(50., [30, 50, 70, 255]);
+        shape.stroke = true;
+        shape.style.primitive = true;
+        let marks = compose(&[rect(0., [30, 50, 70, 255])], vec![shape.clone()]);
+        let last = marks.last().unwrap();
+        assert_eq!(last.points, shape.points);
+        assert_eq!(last.fill, shape.fill);
+        assert!(last.stroke && last.style.primitive);
     }
     #[test]
     fn polygon_selection_preserves_area_and_exact_curve_endpoints() {

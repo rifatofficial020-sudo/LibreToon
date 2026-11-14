@@ -505,11 +505,43 @@ impl Importer<'_> {
         self.warn("Texto importado como contornos; tipografía y disposición pueden variar");
         Ok(out)
     }
-    fn timeline(&mut self, n: &Node) -> Result<SharedVec<Layer>, String> {
+    fn timeline(
+        &mut self,
+        n: &Node,
+    ) -> Result<(SharedVec<Layer>, SharedVec<features::Folder>), String> {
         let mut layers = vec![];
         let Some(list) = n.child("layers") else {
             return Err("Línea de tiempo sin capas".into());
         };
+        let parent_index = |index: usize| {
+            list.children[index]
+                .a("parentLayerIndex")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&parent| parent < index)
+        };
+        let mut folder_ids = HashMap::new();
+        let mut folders = Vec::new();
+        for (index, node) in list.children.iter().enumerate() {
+            if node.name != "DOMLayer" || node.a("layerType") != Some("folder") {
+                continue;
+            }
+            if folders.len() >= 200 {
+                self.warn("Carpetas adicionales omitidas: se alcanzó el límite de 200");
+                break;
+            }
+            let id = features::id();
+            folders.push(features::Folder {
+                id,
+                name: node.a("name").unwrap_or("Folder").into(),
+                parent: parent_index(index).and_then(|parent| folder_ids.get(&parent).copied()),
+                collapsed: node.a("isExpanded") == Some("false"),
+                transform: Default::default(),
+                timeline_slot: None,
+                range: None,
+                source_shift: 0,
+            });
+            folder_ids.insert(index, id);
+        }
         let mask_ids: HashMap<_, _> = list
             .children
             .iter()
@@ -536,19 +568,20 @@ impl Importer<'_> {
             };
             layer.options.locked = node.a("locked") == Some("true");
             layer.options.mask_id = mask_ids.get(&layer_index).copied();
-            let parent = node
-                .a("parentLayerIndex")
-                .and_then(|value| value.parse::<usize>().ok());
+            let parent = parent_index(layer_index);
+            let mut ancestor = parent;
+            while let Some(index) = ancestor {
+                if let Some(&folder) = folder_ids.get(&index) {
+                    layer.options.folder = Some(folder);
+                    break;
+                }
+                ancestor = parent_index(index);
+            }
             if kind == "masked" {
                 layer.options.masked_by = parent.and_then(|index| mask_ids.get(&index).copied());
                 if layer.options.masked_by.is_none() {
                     self.warn(format!("Capa {}: no se encuentra su máscara", layer.name));
                 }
-            } else if parent.is_some() && kind != "guide" {
-                self.warn(format!(
-                    "Capa {}: relación de carpeta o guía no importada",
-                    layer.name
-                ));
             }
             if kind == "guide" || kind == "guided" {
                 self.warn(format!("Capa {}: las guías se conservan como dibujo de referencia; no se reconstruye el vínculo de movimiento", layer.name));
@@ -669,7 +702,7 @@ impl Importer<'_> {
             l.options.keys[0] = true;
         }
         layers.reverse();
-        Ok(layers.into())
+        Ok((layers.into(), folders.into()))
     }
 }
 fn integer(n: &Node, key: &str, default: usize, max: usize) -> Result<usize, String> {
@@ -905,39 +938,46 @@ pub fn import(bytes: &[u8], xml: &str) -> Result<Document, String> {
     }
     for (id, name, n) in &definitions {
         imp.context = format!("Símbolo {name}");
-        let layers = match n.path("timeline/DOMTimeline") {
+        let (layers, folders) = match n.path("timeline/DOMTimeline") {
             Some(t) => match imp.timeline(t) {
                 Ok(l) => l,
                 Err(e) => {
                     imp.warn(format!("Símbolo {name} omitido: {e}"));
-                    vec![Layer {
-                        name: "Recurso no compatible".into(),
-                        visible: true,
-                        frames: vec![SharedVec::default()].into(),
-                        options: Default::default(),
-                    }]
-                    .into()
+                    (
+                        vec![Layer {
+                            name: "Recurso no compatible".into(),
+                            visible: true,
+                            frames: vec![SharedVec::default()].into(),
+                            options: Default::default(),
+                        }]
+                        .into(),
+                        Default::default(),
+                    )
                 }
             },
             None => {
                 imp.warn(format!("Símbolo sin línea de tiempo: {name}"));
-                vec![Layer {
-                    name: "Layer".into(),
-                    visible: true,
-                    frames: vec![SharedVec::default()].into(),
-                    options: Default::default(),
-                }]
-                .into()
+                (
+                    vec![Layer {
+                        name: "Layer".into(),
+                        visible: true,
+                        frames: vec![SharedVec::default()].into(),
+                        options: Default::default(),
+                    }]
+                    .into(),
+                    Default::default(),
+                )
             }
         };
         doc.extras.symbols.push(Symbol {
             id: *id,
             name: name.clone(),
             layers,
-            folders: Default::default(),
+            folders,
             perspective: Default::default(),
             rig: Default::default(),
             library_folder: None,
+            mouth_poses: Default::default(),
         });
     }
     // Traverse the dependency DAG once, not once per held frame or path.
@@ -1023,7 +1063,37 @@ pub fn import(bytes: &[u8], xml: &str) -> Result<Document, String> {
             return Err("Demasiadas escenas".into());
         }
         imp.context = format!("Escena {}", t.a("name").unwrap_or("Escena"));
-        doc.layers = imp.timeline(t)?;
+        (doc.layers, doc.extras.folders) = imp.timeline(t)?;
+        let mut markers = BTreeSet::new();
+        for frame in t
+            .path("layers")
+            .into_iter()
+            .flat_map(|layers| &layers.children)
+            .filter_map(|layer| layer.child("frames"))
+            .flat_map(|frames| &frames.children)
+            .filter(|frame| frame.name == "DOMFrame")
+        {
+            if let Some(name) = frame
+                .a("name")
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                let index = integer(frame, "index", 0, 9999)?;
+                if index < doc.layers[0].frames.len() && name.len() <= 160 && markers.len() < 10000
+                {
+                    markers.insert((index, name.to_owned()));
+                }
+            }
+        }
+        doc.extras.markers = markers
+            .into_iter()
+            .map(|(frame, name)| crate::dialogue::Marker {
+                frame,
+                name,
+                color: [91, 158, 255],
+            })
+            .collect::<Vec<_>>()
+            .into();
         doc.extras.media.tracks.clear();
         let count = doc.layers[0].frames.len();
         for layer in t
@@ -1118,6 +1188,8 @@ pub fn import(bytes: &[u8], xml: &str) -> Result<Document, String> {
         return Err("Documento XFL sin línea de tiempo".into());
     }
     doc.layers = doc.extras.scenes[0].layers.clone();
+    doc.extras.folders = doc.extras.scenes[0].folders.clone();
+    doc.extras.markers = doc.extras.scenes[0].markers.clone();
     doc.extras.media.tracks = doc.extras.scenes[0].media_tracks.clone();
     imp.context.clear();
     if doc.extras.scenes.len() == 1 {

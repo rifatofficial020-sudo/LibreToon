@@ -324,6 +324,7 @@ fn raw_symbol(id: u64, child: Option<u64>) -> Symbol {
         folders: Default::default(),
         perspective: Default::default(),
         library_folder: None,
+        mouth_poses: Default::default(),
         layers: vec![Layer {
             name: "Art".into(),
             visible: true,

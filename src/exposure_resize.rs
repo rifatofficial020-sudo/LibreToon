@@ -11,7 +11,12 @@ pub struct Drag {
     pub maximum: usize,
 }
 impl Editor {
-    fn exposure_limits(&self, layer: usize, start: usize, end: usize) -> Option<(usize, usize)> {
+    pub(crate) fn exposure_limits(
+        &self,
+        layer: usize,
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, usize)> {
         let data = self.doc.layers.get(layer)?;
         if data.options.locked || data.options.animation_track || data.options.mannequin.is_some() {
             return None;

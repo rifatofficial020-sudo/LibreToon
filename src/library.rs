@@ -37,6 +37,7 @@ pub struct LibraryState {
     pub(crate) drag: Option<Asset>,
     rename: Option<(Asset, String)>,
     focus: bool,
+    usage: Option<(Asset, Vec<(String, usize)>)>,
 }
 impl Library {
     pub fn is_empty(&self) -> bool {
@@ -322,12 +323,65 @@ impl Editor {
         }
         self.recover();
     }
+    fn library_usage(&self, asset: Asset) -> Vec<(String, usize)> {
+        let mut usage = Vec::new();
+        let mut scan = |name: &str, layers: &[crate::document::Layer], media: usize| {
+            let mut cels = HashSet::new();
+            let marks = layers
+                .iter()
+                .flat_map(|layer| layer.frames.iter())
+                .filter(|cel| cels.insert(cel.identity()))
+                .flat_map(|cel| cel.iter())
+                .filter(|mark| match asset {
+                    Asset::Symbol(id) => {
+                        mark.style.instance.as_ref().is_some_and(|i| i.symbol == id)
+                    }
+                    Asset::Media(id) => mark.style.media_image == Some(id),
+                    _ => false,
+                })
+                .count();
+            if marks + media > 0 {
+                usage.push((name.to_owned(), marks + media));
+            }
+        };
+        let clip_count = |tracks: &[crate::media::Track]| match asset {
+            Asset::Media(id) => tracks.iter().map(|track| track.asset_use_count(id)).sum(),
+            _ => 0,
+        };
+        scan(
+            tr("Current timeline"),
+            &self.doc.layers,
+            clip_count(&self.doc.extras.media.tracks),
+        );
+        for scene in self
+            .doc
+            .extras
+            .scenes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                *index != self.doc.extras.active_scene || !self.feature.symbol_stack.is_empty()
+            })
+            .map(|(_, scene)| scene)
+        {
+            scan(&scene.name, &scene.layers, clip_count(&scene.media_tracks));
+        }
+        for symbol in self.doc.extras.symbols.iter() {
+            if symbol.layers.identity() != self.doc.layers.identity() {
+                scan(&symbol.name, &symbol.layers, 0);
+            }
+        }
+        usage
+    }
+
     pub fn asset_library_ui(&mut self, ui: &mut egui::Ui) {
         let library_rect = ui.available_rect_before_wrap();
         ui.heading(tr("Biblioteca"));
         self.media_library_ui(ui);
         ui.add_space(6.);
         let mut new_folder = false;
+        let mut inspect_usage = None;
+        let mut replace_media = None;
         let mut edit = None;
         let mut insert = None;
         let mut remove = None;
@@ -616,6 +670,25 @@ impl Editor {
                                 rename = Some(asset);
                                 ui.close();
                             }
+                            if matches!(asset, Asset::Symbol(_) | Asset::Media(_))
+                                && ui.button(tr("Where used")).clicked()
+                            {
+                                inspect_usage = Some(asset);
+                                ui.close();
+                            }
+                            if let Asset::Media(id) = asset {
+                                let choices = self.media_replacement_choices(id);
+                                if !choices.is_empty() {
+                                    ui.menu_button(tr("Replace media placements"), |ui| {
+                                        for (target, name) in choices {
+                                            if ui.button(name).clicked() {
+                                                replace_media = Some((id, target));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                             if let Asset::Folder(id) = asset {
                                 design::category(ui, "COLOR DE CARPETA");
                                 let mut c = tag;
@@ -633,6 +706,28 @@ impl Editor {
                         });
                 }
             });
+        if let Some((old, new)) = replace_media {
+            self.replace_media_placements(old, new);
+        }
+        if let Some(asset) = inspect_usage {
+            self.assets.usage = Some((asset, self.library_usage(asset)));
+        }
+        if let Some((_, usage)) = &self.assets.usage {
+            let mut open = true;
+            egui::Window::new(tr("Where used"))
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    if usage.is_empty() {
+                        ui.label(tr("No placements found"));
+                    }
+                    for (name, count) in usage {
+                        ui.label(format!("{name} · {count}"));
+                    }
+                });
+            if !open {
+                self.assets.usage = None;
+            }
+        }
         if let Some((asset, name)) = commit_rename {
             self.assets.rename = None;
             self.rename_asset(asset, name);

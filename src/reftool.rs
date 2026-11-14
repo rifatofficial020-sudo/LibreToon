@@ -340,7 +340,8 @@ impl Editor {
                 .is_some_and(|c| c.owner.identity() == reference.data.identity());
             let cached = ready.then(|| self.references.cache.get(&id).unwrap());
             let busy = self.references.job.is_some();
-            let eyedropper = self.tool == crate::canvas::Tool::Eyedropper;
+            let picker = self.studio.color_picker;
+            let eyedropper = picker.is_some() || self.tool == crate::canvas::Tool::Eyedropper;
             let response = egui::Window::new(format!("RefTool · {}", reference.name))
                 .id(egui::Id::unique((
                     "reference",
@@ -440,11 +441,14 @@ impl Editor {
                 self.activate_tool(crate::canvas::Tool::Eyedropper);
             }
             if let Some(color) = sampled {
-                self.color = color;
-                self.fill_color = color;
-                self.fill_enabled = true;
-                self.stroke_enabled = true;
-                self.feature.gradient_on = false;
+                if let Some(fill) = picker {
+                    self.apply_picker_color(color, fill);
+                    self.studio.color_picker = None;
+                } else {
+                    self.color = color;
+                    self.apply_picker_color(color, true);
+                    self.stroke_enabled = true;
+                }
             }
             if !open {
                 self.reference_checkpoint();

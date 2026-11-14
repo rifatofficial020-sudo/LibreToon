@@ -383,6 +383,38 @@ fn unpack_windows(package: &Path, unpacked: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn installer_path_arg(flag: &str, path: &Path) -> Result<std::ffi::OsString, String> {
+    let mut arg = std::ffi::OsString::from(flag);
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    arg.push(format!("{}:", char::from(drive)));
+                    arg.push(components.as_path());
+                    return Ok(arg);
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    arg.push(r"\\");
+                    arg.push(server);
+                    arg.push(r"\");
+                    arg.push(share);
+                    arg.push(components.as_path());
+                    return Ok(arg);
+                }
+                Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+                    return Err("Unsupported Windows path for the LibreToon installer".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    arg.push(path);
+    Ok(arg)
+}
+
 fn install(plan: &Plan, tx: &mpsc::Sender<(f32, String)>) -> Result<(), String> {
     let progress = |p, label: &str| {
         let _ = tx.send((p, tr(label).into()));
@@ -407,9 +439,17 @@ fn install(plan: &Plan, tx: &mpsc::Sender<(f32, String)>) -> Result<(), String> 
                 "/NOFORCECLOSEAPPLICATIONS",
                 "/NORESTARTAPPLICATIONS",
             ])
-            .arg(format!("/DIR={}", host.target.display()))
-            .arg(format!("/LOG={}", folder.join("installer.log").display()));
-            checked(c)?;
+            .arg(installer_path_arg("/DIR=", &host.target)?);
+            let log = folder.join("installer.log");
+            c.arg(installer_path_arg("/LOG=", &log)?);
+            checked(c).map_err(|error| {
+                format!(
+                    "{}\n{}\n{}",
+                    error.trim(),
+                    tr("Installer log:"),
+                    log.display()
+                )
+            })?;
         }
         Kind::WindowsPortable => {
             let unpacked = folder.join("unpacked");
@@ -751,6 +791,35 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         root
     }
+    #[cfg(windows)]
+    #[test]
+    fn inno_setup_receives_dos_or_unc_paths_instead_of_verbatim_paths() {
+        for (input, expected) in [
+            (
+                r"\\?\C:\Users\Álvaro\LibreToon test",
+                r"/DIR=C:\Users\Álvaro\LibreToon test",
+            ),
+            (
+                r"\\?\UNC\server\share\LibreToon test",
+                r"/DIR=\\server\share\LibreToon test",
+            ),
+            (r"D:\LibreToon", r"/DIR=D:\LibreToon"),
+        ] {
+            assert_eq!(
+                installer_path_arg("/DIR=", Path::new(input)).unwrap(),
+                expected
+            );
+        }
+        let root = test_dir("instalación con espacios");
+        let canonical = root.canonicalize().unwrap();
+        let log = installer_path_arg("/LOG=", &canonical.join("installer.log")).unwrap();
+        let log = log.to_string_lossy();
+        let path = Path::new(log.strip_prefix("/LOG=").unwrap());
+        assert!(!path.starts_with(r"\\?\"));
+        assert_eq!(path.parent().unwrap().canonicalize().unwrap(), canonical);
+        fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn real_windows_archive_extraction_handles_spaces_quotes_and_unicode() {
         let root = test_dir("literal ' $ space á");

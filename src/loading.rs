@@ -8,12 +8,18 @@ use std::{
 };
 #[derive(Default)]
 struct State {
-    pending: Option<(u64, PathBuf)>,
+    pending: Option<(u64, PathBuf, Option<RecoverySource>)>,
     result: Option<Loaded>,
     generation: u64,
     busy: bool,
     shutdown: bool,
 }
+struct RecoverySource {
+    saved: Option<PathBuf>,
+    stamp: Option<crate::project_save::Stamp>,
+    dirty: bool,
+}
+
 type Loaded = (
     PathBuf,
     Result<Document, String>,
@@ -24,6 +30,7 @@ pub struct Loader {
     shared: Arc<(Mutex<State>, Condvar)>,
     worker: Option<JoinHandle<()>>,
     saved_copy: bool,
+    restoring: bool,
 }
 impl Loader {
     pub fn request_saved_copy(&mut self, path: PathBuf) {
@@ -31,7 +38,40 @@ impl Loader {
         self.saved_copy = true;
     }
     pub fn request(&mut self, path: PathBuf) {
+        self.enqueue(path, None);
+    }
+
+    pub(crate) fn restore(
+        &mut self,
+        recovery: PathBuf,
+        saved: Option<PathBuf>,
+        stamp: Option<crate::project_save::Stamp>,
+        dirty: bool,
+    ) {
+        self.enqueue(
+            recovery,
+            Some(RecoverySource {
+                saved,
+                stamp,
+                dirty,
+            }),
+        );
+    }
+
+    pub(crate) fn cancel_restore(&mut self) {
+        if self.restoring {
+            let mut state = self.shared.0.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.pending = None;
+            state.result = None;
+            state.busy = false;
+            self.restoring = false;
+        }
+    }
+
+    fn enqueue(&mut self, path: PathBuf, recovery: Option<RecoverySource>) {
         self.saved_copy = false;
+        self.restoring = recovery.is_some();
         if self.worker.is_none() {
             let shared = self.shared.clone();
             self.worker = Some(std::thread::spawn(move || {
@@ -44,20 +84,47 @@ impl Loader {
                     if state.shutdown {
                         break;
                     }
-                    let (generation, path) = state.pending.take().unwrap();
+                    let (generation, path, recovery) = state.pending.take().unwrap();
                     drop(state);
-                    let stamp = crate::project_save::stamp(&path);
-                    let mut result =
-                        std::panic::catch_unwind(|| crate::documents::read_project(&path))
-                            .unwrap_or_else(|_| {
-                                Err("El importador no pudo procesar este archivo".into())
-                            });
-                    if result.is_ok() && stamp != crate::project_save::stamp(&path) {
-                        result = Err(
-                            "The file changed while it was being opened. Try opening it again."
-                                .into(),
-                        );
-                    }
+                    let read_saved = |path: &std::path::Path| {
+                        let stamp = crate::project_save::stamp(path);
+                        let doc = crate::documents::read_project(path)?;
+                        if stamp != crate::project_save::stamp(path) {
+                            return Err(
+                                "The file changed while it was being opened. Try opening it again."
+                                    .into(),
+                            );
+                        }
+                        Ok((doc, stamp))
+                    };
+                    let result = std::panic::catch_unwind(|| {
+                        if let Some(recovery) = recovery {
+                            let saved = || {
+                                read_saved(
+                                    recovery
+                                        .saved
+                                        .as_deref()
+                                        .ok_or("No se encuentra el proyecto")?,
+                                )
+                            };
+                            let recovered = || {
+                                crate::documents::read_project(&path)
+                                    .map(|doc| (doc, recovery.stamp))
+                            };
+                            if recovery.dirty {
+                                recovered().or_else(|_| saved())
+                            } else {
+                                saved().or_else(|_| recovered())
+                            }
+                        } else {
+                            read_saved(&path)
+                        }
+                    })
+                    .unwrap_or_else(|_| Err("El importador no pudo procesar este archivo".into()));
+                    let (result, stamp) = match result {
+                        Ok((doc, stamp)) => (Ok(doc), stamp),
+                        Err(error) => (Err(error), None),
+                    };
                     let mut state = lock.lock().unwrap();
                     if generation == state.generation {
                         state.result = Some((path, result, stamp));
@@ -68,7 +135,7 @@ impl Loader {
         }
         let mut state = self.shared.0.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
-        state.pending = Some((state.generation, path));
+        state.pending = Some((state.generation, path, recovery));
         state.result = None;
         state.busy = true;
         self.shared.1.notify_one();
@@ -92,6 +159,11 @@ impl Drop for Loader {
 impl Editor {
     pub fn poll_open(&mut self, ctx: &eframe::egui::Context) {
         if let Some((path, result, stamp)) = self.loader.take() {
+            let restoring = std::mem::take(&mut self.loader.restoring);
+            if restoring {
+                self.finish_restoring_tab(path, result, stamp);
+                return;
+            }
             match result {
                 Ok(doc) => {
                     let imported = doc.extras.imported;

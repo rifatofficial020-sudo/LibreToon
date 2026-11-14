@@ -196,8 +196,9 @@ impl Editor {
         std::mem::swap(&mut self.stroke_enabled, &mut self.fill_enabled);
     }
     pub fn color_swatches(&mut self, ui: &mut egui::Ui) {
-        let old_fill = self.fill_color;
-        let old_stroke = self.color;
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.studio.color_picker = None;
+        }
         let (r, _) = ui.allocate_exact_size(Vec2::new(65., 58.), Sense::hover());
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(Rect::from_min_size(
@@ -206,41 +207,20 @@ impl Editor {
             )),
             |ui| {
                 ui.spacing_mut().interact_size = Vec2::splat(32.);
-                let response = ui
-                    .color_edit_button_srgba(&mut self.color)
-                    .on_hover_text(crate::i18n::tr("Contorno"));
+                let response = self.paint_color_picker(ui, false);
                 ui.painter()
                     .rect_filled(response.rect.shrink(5.), 0., crate::themes::panel());
-                if response.clicked() {
-                    self.color = self.color.to_opaque();
-                    self.active_fill = false;
-                }
             },
         );
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(Rect::from_min_size(r.min, Vec2::splat(30.))),
             |ui| {
                 ui.spacing_mut().interact_size = Vec2::splat(32.);
-                if ui
-                    .color_edit_button_srgba(&mut self.fill_color)
-                    .on_hover_text(crate::i18n::tr("Relleno"))
-                    .clicked()
-                {
-                    self.fill_color = self.fill_color.to_opaque();
-                    self.active_fill = true;
-                }
+                self.paint_color_picker(ui, true);
             },
         );
         ui.advance_cursor_after_rect(r);
         ui.add_space(4.);
-        if old_fill != self.fill_color {
-            self.fill_enabled = true;
-            self.change_selected_style(true, false, false, false);
-        }
-        if old_stroke != self.color {
-            self.stroke_enabled = true;
-            self.change_selected_style(false, true, false, false);
-        }
         ui.horizontal(|ui| {
             if design::button(
                 ui,
@@ -266,9 +246,65 @@ impl Editor {
             }
         });
     }
+    fn paint_color_picker(&mut self, ui: &mut egui::Ui, fill: bool) -> egui::Response {
+        let color = if fill { self.fill_color } else { self.color };
+        let response = ui
+            .add_sized(
+                ui.spacing().interact_size,
+                egui::Button::new("").fill(color),
+            )
+            .on_hover_text(crate::i18n::tr(if fill { "Relleno" } else { "Contorno" }));
+        if response.clicked() || response.double_clicked() {
+            self.studio.color_picker = None;
+            self.active_fill = fill;
+            self.studio.palette.clear_linked_selection();
+        }
+        if response.double_clicked() {
+            self.studio.palette.open = true;
+        }
+        response
+    }
+
+    pub(crate) fn apply_picker_color(&mut self, color: Color32, fill: bool) {
+        if fill {
+            self.fill_color = color;
+            self.fill_enabled = true;
+            self.feature.gradient_on = false;
+        } else {
+            self.color = color;
+            self.stroke_enabled = true;
+        }
+        self.active_fill = fill;
+    }
+
     pub fn properties_ui(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(10.);
+            if self.doc.layers[self.layer].options.light.is_some() {
+                self.light_properties(ui);
+                return;
+            }
+            if !self.playing
+                && !self.doc.layers[self.layer].options.locked
+                && self
+                    .feature
+                    .frame_selection
+                    .is_some_and(|(layer, _, frame)| (layer, frame) == (self.layer, self.frame))
+                && self.doc.layers[self.layer].frames[self.frame]
+                    .iter()
+                    .any(|mark| crate::lip::has_mouth_key(mark, self.frame))
+            {
+                design::category(ui, "LIPSYNC");
+                self.mouth_timeline_menu(ui, self.layer, self.frame, true);
+            }
+            self.lip_pose_properties(ui);
+            self.height_guide_properties(ui);
+            if self.doc.layers[self.layer].options.light_mask {
+                design::category(ui, "Light mask");
+                ui.small(crate::i18n::tr(
+                    "Click to paint. Ctrl or Cmd + click to remove.",
+                ));
+            }
             if self.adjustment_active() {
                 self.adjustment_properties(ui);
                 return;
@@ -413,16 +449,76 @@ impl Editor {
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.)),
                 );
             }
+            if self.tool == Tool::Pen {
+                design::category(ui, "Pen mode");
+                if design::button(
+                    ui,
+                    Icon::Node,
+                    "Edit nodes only",
+                    "Edit existing curves without adding a path",
+                    self.feature.pen_edit_only,
+                    true,
+                )
+                .clicked()
+                {
+                    self.finish_pending_pen();
+                    self.feature.pen_edit_only = !self.feature.pen_edit_only;
+                }
+            }
             if self.tool == Tool::Bucket {
-                design::category(ui, "RELLENO");
-                ui.label(crate::i18n::tr("Cierre de huecos"));
-                egui::ComboBox::from_id_salt("bucket-gap")
-                    .selected_text(self.gap.label())
-                    .show_ui(ui, |ui| {
-                        for gap in crate::bucket::Gap::ALL {
-                            ui.selectable_value(&mut self.gap, gap, gap.label());
-                        }
+                design::category(ui, "FILL METHOD");
+                for (gap, icon) in crate::bucket::Gap::ALL.into_iter().zip([
+                    Icon::Line,
+                    Icon::CapRound,
+                    Icon::Width,
+                    Icon::Transform,
+                ]) {
+                    if design::button(ui, icon, gap.label(), "", self.gap == gap, true).clicked() {
+                        self.gap = gap;
+                    }
+                }
+                ui.small(crate::i18n::tr(
+                    "Shift + click to recalculate an existing fill",
+                ));
+                design::category(ui, "MULTI-FRAME FILL");
+                let has_selection = self
+                    .feature
+                    .frame_selection
+                    .is_some_and(|(layer, _, _)| layer == self.layer);
+                if design::button(
+                    ui,
+                    Icon::Film,
+                    "Fill selected keyframes",
+                    "Pick a point to preview fills across the selected range",
+                    self.feature.bucket_range_armed,
+                    has_selection && self.feature.bucket_range.is_none(),
+                )
+                .clicked()
+                {
+                    self.feature.bucket_range_armed = !self.feature.bucket_range_armed;
+                }
+                if !has_selection {
+                    ui.small(crate::i18n::tr(
+                        "Shift-click timeline cells to select a range",
+                    ));
+                }
+                if ui
+                    .checkbox(
+                        &mut self.feature.bucket_next,
+                        crate::i18n::tr("Fill next keyframes"),
+                    )
+                    .changed()
+                {
+                    self.feature.bucket_range_armed = false;
+                }
+                if self.feature.bucket_next {
+                    ui.horizontal(|ui| {
+                        ui.label(crate::i18n::tr("Additional keyframes"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.feature.bucket_next_count).range(1..=32),
+                        );
                     });
+                }
             }
             if matches!(
                 self.tool,

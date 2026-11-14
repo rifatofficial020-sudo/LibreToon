@@ -21,6 +21,7 @@ struct Key {
     closed: bool,
     fill: bool,
     detail: i32,
+    composited: bool,
 }
 struct Prepared {
     _owner: Mark,
@@ -32,7 +33,7 @@ struct Prepared {
     stroke_holes: Vec<bool>,
 }
 impl Prepared {
-    fn new(mark: &Mark, tolerance: f32) -> Self {
+    fn new(mark: &Mark, tolerance: f32, composited: bool) -> Self {
         let mut rings = vec![vector::flatten(mark, tolerance)];
         rings.extend(
             mark.holes
@@ -67,11 +68,40 @@ impl Prepared {
         let mut stroke_rings = vec![];
         let mut stroke_holes = vec![];
         if mark.stroke
-            && (!mark.width_profile.is_empty()
+            && (composited
+                || !mark.width_profile.is_empty()
                 || mark.style.start_cap != crate::features::Cap::Round
                 || mark.style.end_cap != crate::features::Cap::Round)
         {
-            let outlines = crate::width::outline(mark);
+            let outlines = if composited
+                && mark.width_profile.is_empty()
+                && mark.style.start_cap == crate::features::Cap::Round
+                && mark.style.end_cap == crate::features::Cap::Round
+            {
+                use geo::Buffer;
+                geo::MultiPolygon(
+                    rings
+                        .iter()
+                        .flat_map(|ring| {
+                            if let [point] = ring.as_slice() {
+                                geo::Point::new(f64::from(point.x), f64::from(point.y))
+                                    .buffer(f64::from(mark.width) * 0.5)
+                                    .0
+                            } else {
+                                geo::LineString::from(
+                                    ring.iter()
+                                        .map(|p| (f64::from(p.x), f64::from(p.y)))
+                                        .collect::<Vec<_>>(),
+                                )
+                                .buffer(f64::from(mark.width) * 0.5)
+                                .0
+                            }
+                        })
+                        .collect(),
+                )
+            } else {
+                crate::width::outline(mark)
+            };
             for polygon in &outlines.0 {
                 stroke_holes.push(false);
                 stroke_holes.extend(polygon.interiors().iter().map(|_| true));
@@ -134,6 +164,8 @@ impl Prepared {
 }
 #[derive(Default)]
 pub struct RenderCache {
+    pub(crate) lit_planes: crate::exporter::LitPlanes,
+    pub(crate) post_fx: crate::post::EffectCache,
     entries: HashMap<Key, (Arc<Prepared>, u64)>,
     epoch: u64,
     bytes: usize,
@@ -147,15 +179,21 @@ impl RenderCache {
             .retain(|_, (_, last)| last.saturating_add(1) >= self.epoch);
         self.bytes = self.entries.values().map(|(p, _)| p.bytes()).sum();
     }
-    fn get(&mut self, mark: &Mark, scale: f32) -> Arc<Prepared> {
-        let detail = scale.max(0.001).log2().ceil() as i32;
+    fn get(&mut self, mark: &Mark, scale: f32, composited: bool) -> Arc<Prepared> {
+        // Keep the outline geometry stable as an animated camera crosses zoom levels.
+        let detail = if composited {
+            4
+        } else {
+            scale.max(0.001).log2().ceil() as i32
+        };
         let key = Key {
             points: mark.points.identity(),
             nodes: mark.nodes.identity(),
             holes: mark.holes.identity(),
             profile: mark.width_profile.identity(),
             caps: (mark.style.start_cap, mark.style.end_cap),
-            width: if mark.width_profile.is_empty()
+            width: if !composited
+                && mark.width_profile.is_empty()
                 && mark.style.start_cap == crate::features::Cap::Round
                 && mark.style.end_cap == crate::features::Cap::Round
             {
@@ -168,6 +206,7 @@ impl RenderCache {
             closed: mark.closed,
             fill: mark.fill.is_some(),
             detail,
+            composited,
         };
         if let Some((p, last)) = self.entries.get_mut(&key) {
             *last = self.epoch;
@@ -176,6 +215,7 @@ impl RenderCache {
         let prepared = Arc::new(Prepared::new(
             mark,
             (0.25 / 2f32.powi(detail)).clamp(0.003, 0.5),
+            composited,
         ));
         #[cfg(test)]
         {
@@ -217,9 +257,31 @@ pub fn draw(
     selected: bool,
     cache: Option<&mut RenderCache>,
 ) -> bool {
+    let thick_primitive =
+        mark.stroke && mark.width > 20. && (mark.rectangle || mark.closed && mark.nodes.is_empty());
+    draw_prepared(p, mark, view, ghost, selected, cache, thick_primitive)
+}
+
+pub(crate) fn draw_composited(p: &egui::Painter, mark: &Mark, view: View, cache: &mut RenderCache) {
+    draw_prepared(p, mark, view, false, false, Some(cache), true);
+}
+
+fn draw_prepared(
+    p: &egui::Painter,
+    mark: &Mark,
+    view: View,
+    ghost: bool,
+    selected: bool,
+    cache: Option<&mut RenderCache>,
+    composited: bool,
+) -> bool {
     let prepared = match cache {
-        Some(cache) => cache.get(mark, view.scale),
-        None => Arc::new(Prepared::new(mark, (0.2 / view.scale).clamp(0.003, 0.5))),
+        Some(cache) => cache.get(mark, view.scale, composited),
+        None => Arc::new(Prepared::new(
+            mark,
+            (0.2 / view.scale).clamp(0.003, 0.5),
+            composited,
+        )),
     };
     let color = |rgba: [u8; 4]| {
         if ghost {
@@ -275,11 +337,7 @@ pub fn draw(
             }
         }
     }
-    if mark.stroke
-        && (!mark.width_profile.is_empty()
-            || mark.style.start_cap != crate::features::Cap::Round
-            || mark.style.end_cap != crate::features::Cap::Round)
-    {
+    if mark.stroke && !prepared.stroke_mesh.indices.is_empty() {
         let ink = color(mark.color);
         p.add(egui::Shape::mesh(mesh(&prepared.stroke_mesh, view, ink)));
         let feather = p.ctx().pixels_per_point().max(0.1).recip();
@@ -293,6 +351,7 @@ pub fn draw(
     for ring in &prepared.rings {
         let points: Vec<_> = ring.iter().map(|p| view.screen(*p)).collect();
         if mark.stroke
+            && prepared.stroke_mesh.indices.is_empty()
             && mark.width_profile.is_empty()
             && mark.style.start_cap == crate::features::Cap::Round
             && mark.style.end_cap == crate::features::Cap::Round
@@ -333,6 +392,87 @@ pub fn draw(
         }
     }
     prepared.valid
+}
+
+pub(crate) fn selection_pattern(
+    painter: &egui::Painter,
+    mark: &Mark,
+    view: View,
+    cache: &mut RenderCache,
+) {
+    let prepared = cache.get(mark, view.scale, true);
+    let rings = if mark.fill.is_some() {
+        &prepared.rings
+    } else {
+        &prepared.stroke_rings
+    };
+    let rings: Vec<Vec<Pos2>> = rings
+        .iter()
+        .map(|ring| ring.iter().map(|&p| view.screen(p)).collect())
+        .collect();
+    let clip = painter.clip_rect();
+    let bounds = rings
+        .iter()
+        .flatten()
+        .fold(egui::Rect::NOTHING, |mut bounds, &point| {
+            bounds.extend_with(point);
+            bounds
+        })
+        .intersect(clip);
+    if !bounds.is_positive() || !bounds.is_finite() {
+        return;
+    }
+    let step = ((bounds.area() / 12000.).sqrt().ceil() as i32).max(4);
+    let mut crossings = Vec::new();
+    let mut row = (bounds.top().ceil() as i32).div_euclid(step) * step;
+    while row < bounds.bottom().ceil() as i32 {
+        let y = row as f32;
+        crossings.clear();
+        for ring in &rings {
+            for (&a, &b) in ring.iter().zip(ring.iter().cycle().skip(1)) {
+                if (a.y > y) != (b.y > y) {
+                    crossings.push(a.x + (b.x - a.x) * ((y - a.y) / (b.y - a.y)));
+                }
+            }
+        }
+        crossings.sort_unstable_by(f32::total_cmp);
+        for interval in crossings.chunks_exact(2) {
+            let left = interval[0].max(bounds.left());
+            let right = interval[1].min(bounds.right());
+            let mut column = (left / step as f32).ceil() as i32 * step;
+            while (column as f32) < right {
+                let point = Pos2::new(column as f32, y);
+                painter.circle_filled(point, 1.05, Color32::from_black_alpha(195));
+                painter.circle_filled(point, 0.62, Color32::from_white_alpha(225));
+                column += step;
+            }
+        }
+        row += step;
+    }
+    if mark.stroke && mark.fill.is_none() {
+        let mut carry = 0.;
+        for pair in prepared.rings[0].windows(2) {
+            let (a, b) = (view.screen(pair[0]), view.screen(pair[1]));
+            let delta = b - a;
+            let length = delta.length();
+            if length <= 0.001 {
+                continue;
+            }
+            if egui::Rect::from_two_pos(a, b).intersects(bounds) {
+                let clipped = (bounds.center() - a).dot(delta / length) - bounds.size().length();
+                let mut at = carry + ((clipped - carry) / 4.).ceil().max(0.) * 4.;
+                let end = ((bounds.center() - a).dot(delta / length) + bounds.size().length())
+                    .min(length);
+                while at < end {
+                    let point = a + delta * (at / length);
+                    painter.circle_filled(point, 1.05, Color32::from_black_alpha(195));
+                    painter.circle_filled(point, 0.62, Color32::from_white_alpha(225));
+                    at += 4.;
+                }
+            }
+            carry = (carry - length).rem_euclid(4.);
+        }
+    }
 }
 
 fn gradient_mesh(
@@ -440,15 +580,15 @@ mod tests {
         mark.holes = vec![vec![[10., 10.], [20., 10.], [20., 20.], [10., 20.]].into()].into();
         let mut cache = RenderCache::default();
         cache.begin_frame();
-        let first = cache.get(&mark, 1.);
+        let first = cache.get(&mark, 1., false);
         assert!(first.valid);
         assert!(!first.fill.indices.is_empty());
         mark.fill = Some([255, 0, 0, 255]);
-        let second = cache.get(&mark, 1.);
+        let second = cache.get(&mark, 1., false);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(cache.builds, 1);
         mark.points[0] = [-10., 0.];
-        let third = cache.get(&mark, 1.);
+        let third = cache.get(&mark, 1., false);
         assert!(!Arc::ptr_eq(&first, &third));
         assert_eq!(first.rings[0][0], Pos2::ZERO);
     }
@@ -490,7 +630,7 @@ mod tip_regressions {
                     scale,
                     angle: 0.37,
                 };
-                let prepared = Prepared::new(&mark, 0.04);
+                let prepared = Prepared::new(&mark, 0.04, false);
                 assert!(prepared.valid);
                 let mut bounds = egui::Rect::NOTHING;
                 for ring in &prepared.stroke_rings {
@@ -709,7 +849,7 @@ mod fringe_regressions {
                     scale,
                     angle: -0.2,
                 };
-                let prepared = Prepared::new(&mark, 0.04);
+                let prepared = Prepared::new(&mark, 0.04, false);
                 assert!(prepared.valid);
                 let rings = if mark.stroke {
                     &prepared.stroke_rings
@@ -772,7 +912,7 @@ mod fringe_regressions {
             },
         );
         mark.width_profile = crate::width::Preset::Tapered.stops();
-        let prepared = Prepared::new(&mark, 0.1);
+        let prepared = Prepared::new(&mark, 0.1, false);
         let view = View {
             center: Pos2::new(200., 200.),
             stage_center: Pos2::ZERO,
@@ -831,7 +971,7 @@ pub fn weight_overlay(
     view: View,
     map: impl Fn(Pos2) -> (Pos2, f32),
 ) {
-    let prepared = Prepared::new(mark, (0.2 / view.scale).clamp(0.003, 0.5));
+    let prepared = Prepared::new(mark, (0.2 / view.scale).clamp(0.003, 0.5), false);
     let mut mesh = egui::Mesh::default();
     for triangle in prepared.fill.indices.chunks_exact(3) {
         let a = vector::pos(prepared.fill.vertices[triangle[0] as usize]);

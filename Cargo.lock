@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "libretoon"
-version = "0.4.0"
+version = "0.8.0"
 dependencies = [
  "arboard",
  "crc32fast",

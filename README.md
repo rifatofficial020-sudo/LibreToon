@@ -1,63 +1,62 @@
- 
 <p align="center"><img src="https://i.imgur.com/RNhNwtU.png" width="250" alt="LibreToon logo"></p>
 
 # LibreToon
 
 ### Made by an animator, for animators.
 
-**LibreToon** is a free, open-source, cross-platform 2D animation application built from scratch in **Rust**. Inspired by Adobe Animate's workflow, it brings traditional animation tools and modern features together.
+**LibreToon** is a free, open-source 2D animation application built from scratch in **Rust** for Windows, macOS, and Linux. It brings frame-by-frame drawing, vector and raster artwork, character rigging, and compositing into one workspace.
 
-<p align="center"><img src="https://i.imgur.com/N5REuDb.jpeg" width="1000" alt="LibreToon interface"></p>
+<p align="center"><img src="https://i.imgur.com/0qjDPEz.png" width="1050" alt="LibreToon interface"></p>
 
-**Built with AI. Driven by an animator.** LibreToon is an AI-assisted (vibe-coded) project created by an animator to build the tools they always wanted to use.
+**Built with AI. Driven by an animator.** LibreToon is an independent project led by an animator and developed with AI assistance.
 
-> LibreToon supports `.FLA` files but is not an Adobe Animate clone. It focuses on 2D animation; ActionScript is not supported.
+> LibreToon is our independent reimagining of what an “Animate 2” could have been. It takes inspiration from Adobe Animate’s workflow and has its own Rust implementation. LibreToon projects use the native `.ltoon` format. You can import compatible `.fla` artwork and export an experimental FLA copy. The import report lists unsupported or approximated content. ActionScript is unsupported.
 
 ## Features
 
-### Drawing & References
-- **Classic Brush** and **Advanced Vector Brush** with editable curves.
-- **Pen pressure** for drawing and erasing, including eraser-end support on compatible styluses.
-- **Symmetry, mirror, perspective**, and **toon shading/lighting** tools.
-- **Scissors Tool**, object selection, and **clipping masks**.
-- **Rulers, guides, configurable grid**, and snapping controls.
-- **Independent fill and stroke opacity**.
-- **RefTool** for placing visual references in the workspace.
-- **Poseable 3D mannequin** for character reference.
+Read the [LibreToon User Manual](https://alvillafm.github.io/LibreToon/) or browse its [source chapters](manual/index.md).
 
-### Animation & Timeline
-- **Frame-by-frame animation**, motion tweening, and graphic symbols (loop, play once, or single frame).
-- **Mouse-editable timeline** with draggable keyframes and resizable exposures.
-- **Reusable animation clips** with trimming, speed control, reverse, looping, ping-pong playback, and editable sources.
-- **Cross-project frame copying**, including associated artwork and resources.
-- **Bone rigging** with adjustable influence weights and a **Puppet Tool**.
-- **Order in Layer** controls for managing animation elements.
-- **Animation Manager** with reusable clips and organized folders.
+### Drawing & Color
 
-### Scenes, Compositing & Media
-- **Scene Manager** with drag-and-drop organization.
-- **Composition groups** and folders.
-- **Layer depth** with distance-based blur effects.
-- **Multiple cameras** for different shots.
-- **Media Library** for project assets.
-- **Dedicated audio and video tracks**, separate from the animation timeline.
+- Draw with the **Classic Brush**, **Advanced Vector Brush**, and **Raster Brush**. Edit vector curves with the Pen and Node tools, and use raster brush presets with hardness and opacity controls.
+- Use pressure-sensitive drawing and erasing on compatible tablets, including stylus eraser ends. **Tablet Diagnostics** shows input source, pressure, and tip state.
+- Select fills and strokes independently or together. Use **Vector Trim**, variable stroke widths, clipping masks, symmetry, perspective guides, rulers, grids, and snapping.
+- Fill the current drawing and additional keyframes with **Multi-Frame Fill**, or select a range and preview the fills before applying.
+- Manage **Fill**, **Stroke**, and the **Eyedropper** in the **Color** panel. Edit project-specific main palettes, save favourites, and recolor linked vector artwork by editing its swatches.
+- Place floating image references with **RefTool** and sample colors from them. Pose the **3D mannequin** as a drawing reference.
 
-### Export & Platforms
-- Export to **GIF, MP4, AVI, MOV, MKV**, and more.
-- **Windows, macOS, and Linux** support.
-- **In-app update checker** and installation updates.
+### Animation & Rigging
 
-## Coming Next
+- Animate frame by frame or use **Motion Tweens** with editable easing. Graphic symbols support looping, play once, and single-frame playback.
+- Drag keyframes, resize exposures, copy frames across projects, mark animation ranges, and navigate layers and frames in the **Exposure Sheet**.
+- Store reusable clips in **Animation Manager**. Move, trim, stretch, reverse, loop, or ping-pong clips, and organize them into folders.
+- Rig characters with bones, influence weights, and Puppet pins. Reposition anchors, pose on the stage, and save reusable poses for the same rig.
+- Use **manual or automatic Lip Sync** with custom mouth poses. Edit mouth keys directly in the timeline and preview dialogue against its waveform.
+- Organize drawings in composition groups, with **Switch** and **Solo** folders available in **Layer Objects**. Use **Command Helper** to see shortcuts for the active tool.
 
-- **Lip sync** with phoneme and multilingual support.
-- **Advanced concept art tools** and reference color picking.
-- **More post-processing effects**.
-- **3D transformation tools** and improved scene editing.
+### Scenes, Lighting & Compositing
+
+- Organize scenes, cut between cameras, and animate camera movement and focus. Set layer depth for parallax and depth of field.
+- Add **Point**, **Directional**, **Ambient**, **Rim**, **Rim Shadow**, and **Spot** lights. Choose receiving layers, paint light masks, and set which layer casts or receives a projected shadow.
+- Shape spotlights on the stage and project gobo patterns such as blinds, windows, leaves, or a silhouette from a library symbol.
+- Apply **adjustment layers** to the artwork below or target a layer or folder. Animate effects such as **Bézier color curves**, bloom, lens blur, outline, inner shadow, directional blur, grain, and RGB separation.
+- Prepare preview frames for a scene, selected range, or animation tag. Set viewport quality and preview cache memory in Preferences.
+
+### Media, Projects & Export
+
+- Import images, audio, and video, or paste an image from the clipboard. Arrange and trim clips in dedicated tracks, inspect where assets are used, and replace media while keeping compatible placements.
+- Save native projects with configurable autosave, incremental versions, and recovery.
+- Export **MP4, MKV, AVI, MOV, GIF, SVG, PNG sequences, and sprite sheets**. Batch-export scenes or animation tags and save your own presets. Video export uses an external FFmpeg executable.
+- Check for application updates from **Help**.
 
 ## Experimental Release
 
-**LibreToon is still experimental.** Features may be incomplete, unstable, or buggy. Expect occasional crashes and unexpected behavior.
+LibreToon is still experimental. Some workflows may be incomplete or unstable.
+
+See the [0.6.0 release notes](docs/RELEASE_NOTES_0.6.0.md) for changes since 0.5.5.
 
 ## Contributions & Feedback
 
-LibreToon is open source. **Bug reports, suggestions, and contributions are welcome!** Open an **Issue** or submit a **Pull Request** on GitHub.
+Bug reports, suggestions, and contributions are welcome. Open an issue or submit a pull request on GitHub.
+
+LibreToon’s own code is MIT-licensed. See the [license](LICENSE), [third-party notices](assets/THIRD_PARTY_NOTICES.md), and [asset provenance](assets/ASSET_PROVENANCE.md).

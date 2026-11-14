@@ -772,6 +772,7 @@ impl Editor {
         view: View,
         start: bool,
         down: bool,
+        subtract: bool,
     ) -> bool {
         let raster = self.raster_active();
         let painting = raster && Self::raster_tool(tool);
@@ -796,7 +797,12 @@ impl Editor {
             && crate::folder_groups::layer_active(&self.doc, layer, self.frame)
             && let Some(point) = point
         {
-            let eraser = tool == Tool::Eraser;
+            let mask_brush = layer.options.light_mask && tool == Tool::Brush;
+            let eraser = tool == Tool::Eraser || mask_brush && subtract;
+            let mut brush = self.studio.prefs.raster_brush;
+            if mask_brush && subtract {
+                brush.eraser_size = brush.size;
+            }
             stroke = Some(Stroke {
                 layer: self.layer,
                 frame: self.frame,
@@ -806,9 +812,13 @@ impl Editor {
                 pending: vec![point],
                 wait_for_pressure_until: std::time::Instant::now()
                     + std::time::Duration::from_millis(32),
-                brush: self.studio.prefs.raster_brush,
+                brush,
                 eraser,
-                color: self.color.to_srgba_unmultiplied(),
+                color: if mask_brush {
+                    [255; 4]
+                } else {
+                    self.fill_color.to_srgba_unmultiplied()
+                },
                 tiles: BTreeMap::new(),
                 started: false,
                 bytes: self
@@ -1035,7 +1045,8 @@ mod tests {
         raster.options.clip = true;
         editor.doc.layers.push(raster);
         editor.layer = 1;
-        editor.color = Color32::RED;
+        editor.color = Color32::BLUE;
+        editor.fill_color = Color32::RED;
         editor.studio.prefs.raster_brush = Brush {
             size: 20.,
             ..Brush::default()
@@ -1048,9 +1059,9 @@ mod tests {
         };
         let mut state = std::mem::take(&mut editor.canvas);
         let at = |x| Some(Pos2::new(x, 24.));
-        assert!(editor.raster_input(&mut state, Tool::Brush, at(15.), view, true, true));
-        editor.raster_input(&mut state, Tool::Brush, at(90.), view, false, true);
-        editor.raster_input(&mut state, Tool::Brush, at(90.), view, false, false);
+        assert!(editor.raster_input(&mut state, Tool::Brush, at(15.), view, true, true, false));
+        editor.raster_input(&mut state, Tool::Brush, at(90.), view, false, true, false);
+        editor.raster_input(&mut state, Tool::Brush, at(90.), view, false, false, false);
         assert!(
             editor
                 .doc

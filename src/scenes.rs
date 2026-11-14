@@ -19,6 +19,7 @@ impl Editor {
         }
     }
     pub fn switch_scene(&mut self, index: usize) {
+        self.close_lip_session();
         self.finish_raster_stroke();
         self.feature.exposure_drag = None;
         self.folder_groups.clear();
@@ -29,6 +30,7 @@ impl Editor {
         self.finish_pending_pen();
         animation::store_scene(&mut self.doc);
         let s = self.doc.extras.scenes[index].clone();
+        self.feature.layer_selection = Default::default();
         self.doc.layers = s.layers;
         self.doc.extras.folders = s.folders;
         self.doc.extras.cameras = s.cameras;
@@ -251,6 +253,7 @@ impl Editor {
                                 .position(|s| s.id == active)
                                 .unwrap_or(0);
                             let s = self.doc.extras.scenes[next].clone();
+                            self.feature.layer_selection = Default::default();
                             self.doc.layers = s.layers;
                             self.doc.extras.folders = s.folders;
                             self.doc.extras.cameras = s.cameras;

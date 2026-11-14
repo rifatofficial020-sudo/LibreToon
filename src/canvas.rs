@@ -156,7 +156,8 @@ struct TransformDrag {
     bounds: SelectionBox,
     originals: Vec<((usize, usize), Mark)>,
     changed: bool,
-    last_input: Option<(Pos2, bool)>,
+    last_input: Option<(Pos2, bool, bool)>,
+    toggle_on_click: Option<(usize, usize)>,
 }
 enum Drag {
     Area {
@@ -185,6 +186,8 @@ enum Drag {
     PenNode {
         index: usize,
         start: Pos2,
+        original: crate::document::Node,
+        convert: bool,
     },
     Node(NodeDrag),
     Width(WidthDrag),
@@ -196,6 +199,7 @@ pub struct Canvas {
     pub pan: Vec2,
     pub angle: f32,
     pub selected: Vec<(usize, usize)>,
+    pub(crate) partial: std::collections::HashMap<(usize, usize), (Vec<Mark>, Vec<Mark>)>,
     pub pivot: Option<Pos2>,
     orientation: f32,
     frame: usize,
@@ -217,6 +221,7 @@ impl Default for Canvas {
             pan: Vec2::ZERO,
             angle: 0.,
             selected: vec![],
+            partial: Default::default(),
             pivot: None,
             orientation: 0.,
             frame: 0,
@@ -243,6 +248,7 @@ impl Canvas {
     pub fn clear_selection(&mut self) {
         self.polygon_selection.clear();
         self.selected.clear();
+        self.partial.clear();
         self.node_selection = None;
         self.pivot = None;
         self.orientation = 0.;
@@ -253,6 +259,24 @@ impl Canvas {
         self.pan = Vec2::ZERO;
         self.angle = 0.;
     }
+    fn transform_pivot(&self, editor: &Editor, bounds: SelectionBox) -> Pos2 {
+        self.pivot
+            .or_else(|| {
+                let &[(layer, index)] = self.selected.as_slice() else {
+                    return None;
+                };
+                let marks = crate::animation::marks(&editor.doc.layers[layer], editor.frame);
+                let mark = marks.get(index)?;
+                let instance = mark.style.instance.as_ref()?;
+                let local = crate::vector::pos(mark.style.symbol_pivot?);
+                Some(editor.depth_point(
+                    crate::rig::point(instance.matrix, local),
+                    layer,
+                    editor.layer,
+                ))
+            })
+            .unwrap_or_else(|| bounds.center())
+    }
     fn bounds(&self, e: &Editor) -> Option<SelectionBox> {
         let mut r = Rect::NOTHING;
         let mut evaluated = std::collections::HashMap::new();
@@ -260,6 +284,13 @@ impl Canvas {
             let marks = evaluated
                 .entry(l)
                 .or_insert_with(|| crate::animation::marks(&e.doc.layers[l], e.frame));
+            if let Some((_, inside)) = self.partial.get(&(l, m)) {
+                for point in inside.iter().flat_map(vertices) {
+                    let point = e.depth_point(point, l, e.layer);
+                    r.extend_with(Pos2::ZERO + rotate(point.to_vec2(), -self.orientation));
+                }
+                continue;
+            }
             let mark = &marks[m];
             let points = mark
                 .style
@@ -300,6 +331,53 @@ impl Canvas {
         }
     }
 }
+const SELECTION_BLUE: Color32 = Color32::from_rgb(104, 193, 255);
+
+fn paint_selection_outline(painter: &egui::Painter, corners: [Pos2; 4], dashed: bool) {
+    if corners.iter().any(|point| !point.is_finite()) {
+        return;
+    }
+    let color = Stroke::new(
+        1.5,
+        if dashed {
+            SELECTION_BLUE
+        } else {
+            crate::themes::accent()
+        },
+    );
+    let clip = painter.clip_rect().expand(2.);
+    for (a, b) in corners.into_iter().zip(corners.into_iter().cycle().skip(1)) {
+        if !dashed {
+            painter.line_segment([a, b], color);
+            continue;
+        }
+        // Limit dash generation to the visible portion of large or zoomed objects.
+        let delta = b - a;
+        let (mut start, mut end) = (0.0_f32, 1.0_f32);
+        for axis in 0..2 {
+            if delta[axis] == 0. {
+                if a[axis] < clip.min[axis] || a[axis] > clip.max[axis] {
+                    start = 1.;
+                    end = 0.;
+                }
+            } else {
+                let p = (clip.min[axis] - a[axis]) / delta[axis];
+                let q = (clip.max[axis] - a[axis]) / delta[axis];
+                start = start.max(p.min(q));
+                end = end.min(p.max(q));
+            }
+        }
+        if start < end {
+            painter.extend(egui::Shape::dashed_line(
+                &[a + delta * start, a + delta * end],
+                color,
+                5.,
+                3.,
+            ));
+        }
+    }
+}
+
 pub fn vertices(m: &Mark) -> Vec<Pos2> {
     let mut points = crate::vector::flatten(m, 0.1);
     if m.style.text.is_some() {
@@ -331,7 +409,11 @@ fn distance_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     p.distance(a + ab * t)
 }
 pub(crate) fn stroke_hit(m: &Mark, p: Pos2, tolerance: f32) -> bool {
-    if !m.stroke {
+    if !m.stroke
+        || !crate::vector::control_bounds(m)
+            .expand(tolerance + m.width * if m.width_profile.is_empty() { 0.5 } else { 2. })
+            .contains(p)
+    {
         return false;
     }
     let points = vertices(m);
@@ -434,7 +516,27 @@ impl Editor {
         hit(mark, point, tolerance)
     }
 
+    fn canvas_edit_view(&self, stage: View) -> View {
+        let camera = self.camera_view(stage);
+        if self.tool == Tool::Camera {
+            camera
+        } else {
+            self.camera_depth_view(camera, self.layer)
+        }
+    }
+
+    fn zoom_canvas_at(&self, state: &mut Canvas, area: Rect, screen: Pos2, zoom: f32) -> View {
+        let anchor = self.canvas_edit_view(state.view(area)).world(screen);
+        state.zoom = zoom;
+        let mut view = self.canvas_edit_view(state.view(area));
+        let correction = screen - view.screen(anchor);
+        state.pan += correction;
+        view.center += correction;
+        view
+    }
+
     pub fn canvas_ui(&mut self, ui: &mut egui::Ui) {
+        self.bucket_range_ui(ui.ctx());
         let tool = if self.drawing.pen.eraser() {
             Tool::Eraser
         } else {
@@ -455,6 +557,7 @@ impl Editor {
         } else {
             tool
         };
+        let picker = self.studio.color_picker;
         let mut state = std::mem::take(&mut self.canvas);
         state.stage_size = Vec2::new(self.doc.width as f32, self.doc.height as f32);
         if state.pen.as_ref().is_some_and(|p| {
@@ -486,6 +589,7 @@ impl Editor {
                         .is_some_and(|mark| !mark.style.raster_tile)
             })
         });
+        state.partial.retain(|id, _| state.selected.contains(id));
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let ruler_area = response.rect;
         let area = if self.studio.rulers {
@@ -495,12 +599,20 @@ impl Editor {
         };
         let ruler_painter = painter.clone();
         let painter = painter.with_clip_rect(area);
-        let fit = fit_scale(area, state.stage_size);
-        let stage_view = state.view(area);
-        let mut view = self.camera_depth_view(self.camera_view(stage_view), self.layer);
-        if self.tool == Tool::Camera {
-            view = self.camera_view(stage_view);
+        if response.contains_pointer()
+            && state.drag.is_none()
+            && let Some((screen, scroll)) = ui.input(|i| {
+                let screen = i.pointer.hover_pos()?;
+                let scroll = i.smooth_scroll_delta().y;
+                (area.contains(screen) && scroll != 0. && !i.pointer.primary_down())
+                    .then_some((screen, scroll))
+            })
+        {
+            let zoom = (state.zoom * (scroll * 0.0025).exp()).clamp(0.08, 24.);
+            self.zoom_canvas_at(&mut state, area, screen, zoom);
         }
+        let stage_view = state.view(area);
+        let mut view = self.canvas_edit_view(stage_view);
         let ctx = ui.ctx().clone();
         if egui::DragAndDrop::has_payload_of_type::<crate::media::MediaDrag>(&ctx)
             && let Some(id) = response.dnd_release_payload::<crate::media::MediaDrag>()
@@ -522,12 +634,36 @@ impl Editor {
                 state = std::mem::take(&mut self.canvas);
             }
         }
-        let trim_input =
-            !self.raster_active() && self.vector_trim_input(ui, area, self.camera_view(stage_view));
-        let folder_input =
-            !trim_input && self.folder_canvas_input(ui, area, self.camera_view(stage_view));
-        let video_input =
-            !folder_input && self.video_transform_input(ui, area, self.camera_view(stage_view));
+        let press_position = ctx.input(|i| {
+            i.events.iter().rev().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+        });
+        let picker_click = picker.is_some()
+            && press_position.is_some_and(|pos| {
+                area.contains(pos) && ctx.layer_id_at(pos) == Some(ui.layer_id())
+            });
+        let trace_input = !picker_click && self.shift_trace_input(ui, area, view);
+        let light_input = trace_input
+            || (!picker_click && self.light_gizmo(ui, self.camera_view(stage_view), true));
+        let trim_input = !picker_click
+            && !light_input
+            && !self.raster_active()
+            && self.vector_trim_input(ui, area, self.camera_view(stage_view));
+        let folder_input = !picker_click
+            && !light_input
+            && !trim_input
+            && self.folder_canvas_input(ui, area, self.camera_view(stage_view));
+        let video_input = !picker_click
+            && !light_input
+            && !folder_input
+            && self.video_transform_input(ui, area, self.camera_view(stage_view));
         if video_input {
             state.clear_selection();
         }
@@ -547,19 +683,17 @@ impl Editor {
             released,
             space,
             shift,
-            scroll,
             escape,
         ) = ctx.input(|i| {
             (
                 i.pointer.interact_pos(),
-                !video_input && i.pointer.button_pressed(PointerButton::Primary),
+                !picker_click && !video_input && i.pointer.button_pressed(PointerButton::Primary),
                 i.pointer.button_pressed(PointerButton::Middle),
                 i.pointer.button_down(PointerButton::Primary),
                 i.pointer.button_down(PointerButton::Middle),
                 i.pointer.button_released(PointerButton::Primary),
                 i.key_down(egui::Key::Space) && !wants_keyboard,
                 i.modifiers.shift,
-                i.smooth_scroll_delta().y,
                 i.key_pressed(egui::Key::Escape),
             )
         });
@@ -596,30 +730,32 @@ impl Editor {
                 }
             }
         }
-        let press_position = ctx.input(|i| {
-            i.events.iter().rev().find_map(|event| match event {
-                egui::Event::PointerButton {
-                    pos,
-                    button: PointerButton::Primary,
-                    pressed: true,
-                    ..
-                } => Some(*pos),
-                _ => None,
-            })
-        });
-        let visual_handled = self.visual_canvas_input(ui, area, view, &state.selected);
-        let mut guide_handled = if (self.adjustment_active()
-            && !space
-            && !middle_down
-            && !matches!(
-                tool,
-                Tool::Pan
-                    | Tool::Zoom
-                    | Tool::RotateView
-                    | Tool::Select
-                    | Tool::Object
-                    | Tool::Transform
-            ))
+        if let Some(fill) = picker.filter(|_| picker_click) {
+            let _ = self.sample_at(
+                view.world(press_position.unwrap()),
+                3. / view.scale,
+                Some(fill),
+            );
+            self.studio.color_picker = None;
+        }
+        let character_bones = self.character_bone_input(ui, &painter, area, view);
+        let visual_handled =
+            !picker_click && self.visual_canvas_input(ui, area, view, &state.selected);
+        let mut guide_handled = if picker_click
+            || (self.adjustment_active()
+                && !space
+                && !middle_down
+                && !matches!(
+                    tool,
+                    Tool::Pan
+                        | Tool::Zoom
+                        | Tool::RotateView
+                        | Tool::Select
+                        | Tool::Object
+                        | Tool::Transform
+                ))
+            || character_bones
+            || light_input
             || trim_input
             || folder_input
             || self.folder_groups.dialog.is_some()
@@ -634,7 +770,7 @@ impl Editor {
                 | self.rulers_ui(ui, &ruler_painter, ruler_area, view)
                 | self.advanced_canvas_input(ui, area, view)
                 | self.mannequin_input(ui, area, view)
-                | self.rig_input(ui, area, view)
+                | self.rig_input(ui, area, view, &state.selected)
         };
         let raster_edit = self.raster_active() && Self::raster_tool(tool);
         let raster_blocked = self.raster_active()
@@ -660,6 +796,7 @@ impl Editor {
                 && !guide_handled
                 && !space,
             primary_down && !space && !escape,
+            ctx.input(|i| i.modifiers.ctrl || i.modifiers.command),
         );
         if Self::raster_needs_tick(&state) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -699,9 +836,27 @@ impl Editor {
             }
         }
         let mut convert = false;
+        let mut lip_symbol = false;
         let mut arrange = None;
+        let mut clipboard = None;
         if tool != Tool::Mannequin {
             response.context_menu(|ui| {
+                let selected = !state.selected.is_empty() && !self.playing;
+                for (icon, label, enabled) in [
+                    (Icon::Copy, "Copiar", selected),
+                    (Icon::Cut, "Cortar", selected),
+                    (
+                        Icon::Paste,
+                        "Pegar",
+                        !self.playing && !self.doc.layers[self.layer].options.locked,
+                    ),
+                ] {
+                    if crate::design::button(ui, icon, label, label, false, enabled).clicked() {
+                        clipboard = Some(icon);
+                        ui.close();
+                    }
+                }
+                ui.separator();
                 arrange = crate::ordering::menu(ui, !state.selected.is_empty() && !self.playing);
                 ui.separator();
                 if crate::design::button(
@@ -717,44 +872,94 @@ impl Editor {
                     convert = true;
                     ui.close();
                 }
+                if crate::design::button(
+                    ui,
+                    Icon::Mouth,
+                    "Convert to Lip Sync symbol",
+                    "",
+                    false,
+                    !state.selected.is_empty() && !self.playing,
+                )
+                .clicked()
+                {
+                    lip_symbol = true;
+                    ui.close();
+                }
             });
+        }
+        if let Some(action) = clipboard {
+            self.canvas = state;
+            match action {
+                Icon::Copy => self.copy_canvas_to_clipboard(&ctx, false),
+                Icon::Cut => self.copy_canvas_to_clipboard(&ctx, true),
+                _ => self.paste_canvas_clipboard(),
+            }
+            state = std::mem::take(&mut self.canvas);
+            ctx.request_repaint();
         }
         if let Some(action) = arrange {
             self.arrange_selection(&mut state, action);
         }
-        if convert {
+        if convert || lip_symbol {
             self.canvas = state;
-            self.convert_symbol();
+            self.convert_symbol_kind(lip_symbol);
             state = std::mem::take(&mut self.canvas);
             ctx.request_repaint();
         }
-        if !video_input
-            && response.double_clicked()
+        if !picker_click
+            && !video_input
+            && !light_input
+            && over
+            && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary))
             && matches!(tool, Tool::Select | Tool::Object | Tool::Transform)
         {
             if let Some(screen) = pointer {
                 let world = view.world(screen);
-                let symbol = self
+                let hit = self
                     .doc
                     .layers
                     .iter()
                     .enumerate()
                     .rev()
-                    .filter(|(_, l)| l.visible && !l.options.locked)
+                    .filter(|(_, l)| l.visible)
                     .find_map(|(l, layer)| {
                         let marks = crate::animation::marks(layer, self.frame);
                         marks
                             .iter()
+                            .enumerate()
                             .rev()
-                            .find(|mark| self.depth_hit(l, mark, world, 0.))
-                            .map(|mark| {
-                                mark.style.instance.as_ref().map(|instance| instance.symbol)
-                            })
-                    })
-                    .flatten();
-                if let Some(id) = symbol {
+                            .find(|(_, mark)| self.depth_hit(l, mark, world, 3. / view.scale))
+                            .map(|(m, mark)| (l, m, mark.style.instance.as_ref().map(|i| i.symbol)))
+                    });
+                if let Some((l, _, Some(id))) = hit
+                    && !self.doc.layers[l].options.locked
+                {
                     self.canvas = state;
                     self.enter_symbol(id);
+                    return;
+                }
+                if let Some((l, m, None)) = hit
+                    && matches!(tool, Tool::Select | Tool::Object)
+                    && !self.doc.layers[l].options.locked
+                    && stroke_hit(
+                        &self.doc.layers[l].frames[self.frame][m],
+                        self.depth_point(world, self.layer, l),
+                        3. / view.scale,
+                    )
+                {
+                    self.select_connected_strokes(&mut state, (l, m));
+                    state.drag = None;
+                    state.pivot = None;
+                    self.layer = l;
+                    ctx.request_repaint();
+                }
+                let stage_bounds = Rect::from_min_size(Pos2::ZERO, state.stage_size);
+                if hit.is_none()
+                    && !self.feature.symbol_stack.is_empty()
+                    && stage_bounds.contains(stage_view.world(screen))
+                {
+                    self.canvas = state;
+                    self.exit_symbol();
                     return;
                 }
             }
@@ -769,7 +974,9 @@ impl Editor {
                 self.commit_pen(pen);
             }
         }
-        if tool == Tool::Node && !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        if matches!(tool, Tool::Node | Tool::Pen)
+            && !wants_keyboard
+            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
         {
             if let Some((l, m, index)) = state.node_selection.take() {
                 let mut mark = editable_nodes(&self.doc.layers[l].frames[self.frame][m]);
@@ -785,14 +992,6 @@ impl Editor {
                 }
                 self.recover();
             }
-        }
-        if over && scroll != 0. && state.drag.is_none() {
-            let p = pointer.unwrap();
-            let before = view.world(p);
-            state.zoom = (state.zoom * (scroll * 0.0025).exp()).clamp(0.08, 24.);
-            view.scale = fit * state.zoom;
-            state.pan += p - view.screen(before);
-            view.center = area.center() + state.pan;
         }
         if escape {
             self.cancel_guide_drag();
@@ -821,6 +1020,7 @@ impl Editor {
                 && matches!(tool, Tool::Select | Tool::Transform | Tool::Object)
             {
                 state.selected.clear();
+                state.partial.clear();
                 for (l, layer) in self
                     .doc
                     .layers
@@ -840,13 +1040,15 @@ impl Editor {
                 && ctx.input(|i| i.key_pressed(egui::Key::Delete))
                 && !state.selected.is_empty()
             {
-                let mut ids = state.selected.clone();
-                if ids
+                if state
+                    .selected
                     .iter()
                     .any(|(l, _)| !self.doc.layers[*l].options.animation_track)
                 {
                     self.checkpoint();
                 }
+                self.materialize_fragments(&mut state);
+                let mut ids = state.selected.clone();
                 ids.sort_unstable();
                 for (l, m) in ids.into_iter().rev() {
                     if !self.queue_animation_clip_delete(l) {
@@ -871,17 +1073,21 @@ impl Editor {
                     if self.queue_animation_clip_duplicate(l) {
                         continue;
                     }
-                    let mark = transformed(
-                        &self.doc.layers[l].frames[self.frame][m],
-                        Pos2::ZERO,
-                        Vec2::splat(1.),
-                        0.,
-                        Vec2::splat(15.),
+                    let source = state.partial.get(&(l, m)).map_or_else(
+                        || std::slice::from_ref(&self.doc.layers[l].frames[self.frame][m]),
+                        |(_, inside)| inside.as_slice(),
                     );
+                    let copies: Vec<_> = source
+                        .iter()
+                        .map(|mark| {
+                            transformed(mark, Pos2::ZERO, Vec2::splat(1.), 0., Vec2::splat(15.))
+                        })
+                        .collect();
                     let index = self.doc.layers[l].frames[self.frame].len();
-                    self.doc.layers[l].frames[self.frame].push(mark);
-                    selected.push((l, index));
+                    selected.extend((index..index + copies.len()).map(|m| (l, m)));
+                    self.doc.layers[l].frames[self.frame].extend(copies);
                 }
+                state.partial.clear();
                 state.selected = selected;
                 state.pivot = state.pivot.map(|p| p + Vec2::splat(15.));
                 self.recover();
@@ -911,12 +1117,9 @@ impl Editor {
             if middle_pressed || (pressed && (space || tool == Tool::Pan)) {
                 state.drag = Some(Drag::Pan(screen));
             } else if tool == Tool::Zoom {
-                let old = view.world(screen);
-                state.zoom =
+                let zoom =
                     (state.zoom * if self.zoom_out ^ alt { 0.8 } else { 1.25 }).clamp(0.05, 32.);
-                view = self.camera_depth_view(self.camera_view(state.view(area)), self.layer);
-                state.pan += screen - view.screen(old);
-                view = self.camera_depth_view(self.camera_view(state.view(area)), self.layer);
+                view = self.zoom_canvas_at(&mut state, area, screen, zoom);
             } else if !self.playing
                 && tool == Tool::Text
                 && !self.doc.layers[self.layer].options.locked
@@ -966,7 +1169,7 @@ impl Editor {
                 && tool == Tool::Select
                 && selected_node_hit(self, &state, world, view)
             {
-                self.start_node_drag(&mut state, world, view);
+                self.start_node_drag(&mut state, world, view, alt);
             } else if tool == Tool::RotateView {
                 let delta = screen - view.center;
                 state.drag = Some(Drag::ViewRotate {
@@ -979,18 +1182,28 @@ impl Editor {
                 && !self.doc.layers[self.layer].options.locked
                 && self.doc.layers[self.layer].options.mannequin.is_none()
             {
-                self.begin_pen(&mut state, world, view);
+                if self.feature.pen_edit_only || (alt && state.pen.is_none()) {
+                    self.start_node_drag(&mut state, world, view, alt);
+                } else if state.pen.is_some()
+                    || !self.grab_selected_node(&mut state, world, view, alt)
+                {
+                    self.begin_pen(&mut state, world, view, alt);
+                }
             } else if !self.playing
                 && tool == Tool::Bucket
                 && self.doc.layers[self.layer].visible
                 && !self.doc.layers[self.layer].options.locked
                 && self.doc.layers[self.layer].options.mannequin.is_none()
             {
-                self.bucket_at(&mut state, world);
+                if self.feature.bucket_range_armed || self.feature.bucket_next {
+                    self.start_bucket_range(&ctx, world, shift);
+                } else {
+                    self.bucket_at(&mut state, world, shift);
+                }
             } else if !self.playing && tool == Tool::Width {
                 self.start_width_drag(&mut state, world, view);
             } else if !self.playing && tool == Tool::Node {
-                self.start_node_drag(&mut state, world, view);
+                self.start_node_drag(&mut state, world, view, alt);
             } else if !self.playing
                 && matches!(
                     tool,
@@ -1029,7 +1242,7 @@ impl Editor {
                 } else {
                     world
                 };
-                self.drawing.start(world);
+                self.drawing.start(world, tool);
                 self.draft = Some(Mark {
                     points: vec![[world.x, world.y]].into(),
                     width: self.width,
@@ -1049,8 +1262,9 @@ impl Editor {
                             | Tool::FillBrush
                             | Tool::ShadeBrush
                             | Tool::LightBrush
+                            | Tool::VectorBrush
                     ) {
-                        self.fill_color.to_array()
+                        self.fill_color.to_srgba_unmultiplied()
                     } else {
                         self.color.to_array()
                     },
@@ -1080,7 +1294,7 @@ impl Editor {
                 let force_marquee = command && tool == Tool::Select;
                 let mut op = None;
                 if let Some(bounds) = state.bounds(self).filter(|_| !force_marquee) {
-                    let pivot = state.pivot.unwrap_or(bounds.center());
+                    let pivot = state.transform_pivot(self, bounds);
                     state.pivot = Some(pivot);
                     if tool == Tool::Transform {
                         if screen.distance(view.screen(pivot)) < 10. {
@@ -1116,6 +1330,7 @@ impl Editor {
                         op = Some(Operation::Move);
                     }
                 }
+                let mut toggle_on_click = None;
                 if op.is_none() {
                     let mut found = None;
                     'layers: for (l, layer) in self
@@ -1139,44 +1354,67 @@ impl Editor {
                     }
                     if let Some(mut id) = found {
                         if tool == Tool::Object {
-                            self.select_connected_object(&mut state, id, shift);
-                        }
-                        if tool == Tool::Select
-                            && !state.selected.contains(&id)
-                            && self.doc.layers[id.0].frames[self.frame][id.1]
-                                .style
-                                .instance
-                                .is_none()
-                            && self.doc.layers[id.0].frames[self.frame][id.1]
-                                .style
-                                .media_image
-                                .is_none()
-                        {
-                            let wants_stroke = stroke_hit(
-                                &self.doc.layers[id.0].frames[self.frame][id.1],
-                                world,
-                                6. / view.scale,
-                            );
-                            id = self.separate_component(&mut state, id, wants_stroke);
-                            if wants_stroke {
-                                id = self.split_clicked_crossing(&mut state, id, world);
+                            if shift && state.selected.contains(&id) {
+                                toggle_on_click = Some(id);
+                                op = Some(Operation::Move);
                             } else {
-                                id = self.split_fill_face(&mut state, id, world);
+                                self.select_connected_object(&mut state, id, shift);
+                                self.layer = id.0;
+                                if !shift {
+                                    op = Some(Operation::Move);
+                                }
                             }
-                        }
-                        if shift && state.selected.contains(&id) {
-                            state.selected.retain(|x| *x != id);
-                            state.pivot = state.bounds(self).map(|b| b.center());
+                            state.pivot = None;
                         } else {
-                            if !shift && !state.selected.contains(&id) {
-                                state.selected.clear();
+                            let mut segment = None;
+                            if tool == Tool::Select
+                                && !state.selected.contains(&id)
+                                && self.doc.layers[id.0].frames[self.frame][id.1]
+                                    .style
+                                    .instance
+                                    .is_none()
+                                && self.doc.layers[id.0].frames[self.frame][id.1]
+                                    .style
+                                    .media_image
+                                    .is_none()
+                            {
+                                let wants_stroke = stroke_hit(
+                                    &self.doc.layers[id.0].frames[self.frame][id.1],
+                                    world,
+                                    6. / view.scale,
+                                );
+                                id = self.separate_component(&mut state, id, wants_stroke);
+                                if wants_stroke
+                                    && !self.doc.layers[id.0].frames[self.frame][id.1]
+                                        .style
+                                        .primitive
+                                {
+                                    segment = self.preview_stroke_segment(
+                                        id,
+                                        self.depth_point(world, self.layer, id.0),
+                                    );
+                                } else if !wants_stroke {
+                                    id = self.split_fill_face(&mut state, id, world);
+                                }
                             }
-                            if !state.selected.contains(&id) {
-                                state.selected.push(id);
+                            if shift && state.selected.contains(&id) {
+                                toggle_on_click = Some(id);
+                                op = Some(Operation::Move);
+                            } else {
+                                if !shift && !state.selected.contains(&id) {
+                                    state.selected.clear();
+                                    state.partial.clear();
+                                }
+                                if !state.selected.contains(&id) {
+                                    state.selected.push(id);
+                                }
+                                if let Some(parts) = segment {
+                                    state.partial.insert(id, parts);
+                                }
+                                self.layer = id.0;
+                                state.pivot = None;
+                                op = Some(Operation::Move);
                             }
-                            self.layer = id.0;
-                            state.pivot = state.bounds(self).map(|b| b.center());
-                            op = Some(Operation::Move);
                         }
                     } else {
                         if !shift {
@@ -1191,7 +1429,7 @@ impl Editor {
                 }
                 if let (Some(operation), Some(bounds)) = (op, state.bounds(self)) {
                     self.prepare_snapping(&state.selected);
-                    let pivot = state.pivot.unwrap_or(bounds.center());
+                    let pivot = state.transform_pivot(self, bounds);
                     let originals = state
                         .selected
                         .iter()
@@ -1210,6 +1448,7 @@ impl Editor {
                         originals,
                         changed: false,
                         last_input: None,
+                        toggle_on_click,
                     }));
                 }
             }
@@ -1308,9 +1547,30 @@ impl Editor {
                         state.drag = None;
                     }
                 }
-                Some(Drag::PenNode { index, start }) => {
+                Some(Drag::PenNode {
+                    index,
+                    start,
+                    original,
+                    convert,
+                }) => {
                     if let Some(pen) = &mut state.pen {
-                        if primary_down
+                        if *convert && (primary_down || released) {
+                            let delta = world - *start;
+                            if delta.length() > 2. / view.scale {
+                                let handle = crate::vector::pos(original.out_handle) + delta;
+                                pen.mark.nodes[*index].out_handle = crate::vector::xy(handle);
+                                if original.in_handle == original.position
+                                    && original.out_handle == original.position
+                                {
+                                    pen.mark.nodes[*index].in_handle = crate::vector::xy(
+                                        crate::vector::pos(original.position) - delta,
+                                    );
+                                }
+                            } else if released {
+                                pen.mark.nodes[*index] =
+                                    crate::document::Node::corner(original.position);
+                            }
+                        } else if primary_down
                             && (!pen.closing || world.distance(*start) > 1. / view.scale)
                         {
                             let node = &mut pen.mark.nodes[*index];
@@ -1368,13 +1628,36 @@ impl Editor {
                         .input(|i| node_contact_position(&i.events, primary_down))
                         .map(|p| self.depth_point(view.world(p), self.layer, d.id.0));
                     if let Some(world) = world.filter(|p| p.is_finite()) {
-                        if world.distance(d.start) > 0.001 || d.changed {
+                        if (d.handle == 3 && released)
+                            || world.distance(d.start)
+                                > if d.handle == 3 {
+                                    2. / view.scale
+                                } else {
+                                    0.001
+                                }
+                            || d.changed
+                        {
                             if !d.changed {
                                 self.checkpoint();
                                 d.changed = true;
                             }
+                            let delta = world - d.start;
                             let mark =
-                                move_node(&d.original, d.index, d.handle, world - d.start, alt);
+                                if d.handle == 3 && delta.length() <= 2. / view.scale && !d.moved {
+                                    let mut mark = editable_nodes(&d.original);
+                                    let node = &mut mark.nodes[d.index];
+                                    *node = crate::document::Node::corner(node.position);
+                                    mark
+                                } else {
+                                    d.moved = true;
+                                    move_node(
+                                        &d.original,
+                                        d.index,
+                                        d.handle,
+                                        delta,
+                                        alt || d.independent,
+                                    )
+                                };
                             self.doc.layers[d.id.0].frames[self.frame][d.id.1] = mark;
                         }
                     }
@@ -1395,7 +1678,10 @@ impl Editor {
                         world
                     };
                     if let Some(m) = &mut self.draft {
-                        if matches!(*tool, Tool::Line | Tool::Ellipse | Tool::Polygon) {
+                        if matches!(
+                            *tool,
+                            Tool::Line | Tool::Ellipse | Tool::Polygon | Tool::Rectangle
+                        ) {
                             let a = smoother.last();
                             let mut b = shape_world;
                             if shift {
@@ -1413,22 +1699,19 @@ impl Editor {
                                     );
                                 }
                             }
-                            *m = crate::editing::shape(
-                                *tool,
-                                a,
-                                b,
-                                self.polygon_sides,
-                                self.polygon_star,
-                                self.star_ratio,
-                                m,
-                            );
-                        } else if *tool == Tool::Rectangle {
-                            *m = crate::drawing::rounded_rectangle(
-                                smoother.last(),
-                                world,
-                                self.drawing.radius,
-                                m,
-                            );
+                            *m = if *tool == Tool::Rectangle {
+                                crate::drawing::rounded_rectangle(a, b, self.drawing.radius, m)
+                            } else {
+                                crate::editing::shape(
+                                    *tool,
+                                    a,
+                                    b,
+                                    self.polygon_sides,
+                                    self.polygon_star,
+                                    self.star_ratio,
+                                    m,
+                                )
+                            };
                         } else {
                             let samples = ctx.input(|i| {
                                 let first = if pressed {
@@ -1448,19 +1731,32 @@ impl Editor {
                                 } else {
                                     0
                                 };
-                                i.events[first..]
-                                    .iter()
-                                    .filter_map(|e| match e {
-                                        egui::Event::PointerMoved(p) => Some(*p),
+                                let mut samples = Vec::new();
+                                for event in &i.events[first..] {
+                                    match event {
+                                        egui::Event::PointerMoved(p) if p.is_finite() => {
+                                            samples.push(*p)
+                                        }
                                         egui::Event::PointerButton {
                                             pos,
                                             button: PointerButton::Primary,
                                             pressed: false,
                                             ..
-                                        } => Some(*pos),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
+                                        } => {
+                                            if pos.is_finite() {
+                                                samples.push(*pos);
+                                            }
+                                            break;
+                                        }
+                                        egui::Event::PointerGone
+                                        | egui::Event::Touch {
+                                            phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
+                                            ..
+                                        } => break,
+                                        _ => {}
+                                    }
+                                }
+                                samples
                             });
                             for screen in samples {
                                 let p = crate::vector::xy(view.world(screen));
@@ -1479,6 +1775,7 @@ impl Editor {
                                 *tool,
                                 Tool::Rectangle | Tool::Line | Tool::Ellipse | Tool::Polygon
                             ) {
+                                m.style.primitive = *tool != Tool::Line;
                                 parts.push(m);
                             } else {
                                 let curves =
@@ -1574,12 +1871,28 @@ impl Editor {
                     }
                 }
                 Some(Drag::Transform(d)) => {
-                    if d.last_input != Some((world, shift))
-                        && (d.changed || world.distance(d.start) > 0.01)
+                    if d.last_input != Some((world, shift, alt))
+                        && (d.changed || world.distance(d.start) * view.scale > 2.)
                     {
-                        d.last_input = Some((world, shift));
+                        d.last_input = Some((world, shift, alt));
                         if !d.changed && !matches!(d.operation, Operation::Pivot) {
                             self.checkpoint();
+                            if !state.partial.is_empty() {
+                                let mut selection = Canvas {
+                                    selected: std::mem::take(&mut state.selected),
+                                    partial: std::mem::take(&mut state.partial),
+                                    ..Default::default()
+                                };
+                                self.materialize_fragments(&mut selection);
+                                state.selected = selection.selected;
+                                d.originals = state
+                                    .selected
+                                    .iter()
+                                    .map(|&(l, m)| {
+                                        ((l, m), self.doc.layers[l].frames[self.frame][m].clone())
+                                    })
+                                    .collect();
+                            }
                             self.autokey_motion(&state.selected);
                         }
                         d.changed = true;
@@ -1593,11 +1906,19 @@ impl Editor {
                                 let mut translation = Vec2::ZERO;
                                 match operation {
                                     Operation::Move => {
-                                        translation = self.snap_translation(
+                                        translation = world - d.start;
+                                        let axis = shift.then(|| {
+                                            usize::from(translation.y.abs() > translation.x.abs())
+                                        });
+                                        if let Some(axis) = axis {
+                                            translation[1 - axis] = 0.;
+                                        }
+                                        translation = self.snap_translation_axes(
                                             Rect::from_points(&d.bounds.handles()),
-                                            world - d.start,
+                                            translation,
                                             view,
                                             alt,
+                                            axis,
                                         );
                                         state.pivot = Some(d.pivot + translation);
                                     }
@@ -1654,8 +1975,38 @@ impl Editor {
                         }
                     }
                     if released || !primary_down {
+                        if d.changed
+                            && matches!(d.operation, Operation::Pivot)
+                            && let [((layer, index), original)] = d.originals.as_slice()
+                            && let Some(instance) = &original.style.instance
+                            && let Some(inverse) = crate::rig::inverse(instance.matrix)
+                            && let Some(pivot) = state.pivot
+                        {
+                            let pivot = self.depth_point(pivot, self.layer, *layer);
+                            let local = crate::rig::point(inverse, pivot);
+                            if local.is_finite() {
+                                self.checkpoint();
+                                self.doc.layers[*layer].frames[self.frame][*index]
+                                    .style
+                                    .symbol_pivot = Some(crate::vector::xy(local));
+                            }
+                        }
                         if d.changed {
                             self.recover();
+                        } else if let Some(id) = d.toggle_on_click {
+                            if tool == Tool::Object {
+                                let mut connected = Canvas::default();
+                                self.select_connected_object(&mut connected, id, false);
+                                state
+                                    .selected
+                                    .retain(|item| !connected.selected.contains(item));
+                            } else {
+                                state.selected.retain(|item| *item != id);
+                            }
+                            state
+                                .partial
+                                .retain(|item, _| state.selected.contains(item));
+                            state.pivot = state.bounds(self).map(|bounds| bounds.center());
                         }
                         state.drag = None;
                     }
@@ -1691,14 +2042,18 @@ impl Editor {
             }
         }
         if over {
-            ctx.set_cursor_icon(if matches!(state.drag, Some(Drag::Pan(_))) {
+            ctx.set_cursor_icon(if picker.is_some() {
+                CursorIcon::Crosshair
+            } else if matches!(state.drag, Some(Drag::Pan(_))) {
                 CursorIcon::Grabbing
             } else if space || tool == Tool::Pan {
                 CursorIcon::Grab
             } else if matches!(
                 tool,
-                Tool::Rectangle | Tool::Ellipse | Tool::Polygon | Tool::Line | Tool::Pen
+                Tool::Rectangle | Tool::Ellipse | Tool::Polygon | Tool::Line
             ) {
+                CursorIcon::None
+            } else if tool == Tool::Pen {
                 CursorIcon::Crosshair
             } else if matches!(tool, Tool::Select | Tool::Transform | Tool::Object) {
                 CursorIcon::Default
@@ -1718,6 +2073,7 @@ impl Editor {
                 CursorIcon::Default
             });
         }
+        let stage_view = state.view(area);
         let corners = [
             Pos2::ZERO,
             Pos2::new(state.stage_size.x, 0.),
@@ -1731,11 +2087,8 @@ impl Editor {
             Stroke::new(1., Color32::from_gray(90)),
         ));
         self.paint_grid(&painter, area, view);
-        if self.onion && !self.playing {
-            let count = self.doc.layers[0].frames.len();
-            for f in self.frame.saturating_sub(self.studio.onion_before)
-                ..(self.frame + self.studio.onion_after + 1).min(count)
-            {
+        if self.onion && !self.playing && !self.animation.frame_workflow.tracing() {
+            for f in self.onion_frames() {
                 if f == self.frame {
                     continue;
                 }
@@ -1793,7 +2146,7 @@ impl Editor {
                 self.paint_mannequin_layer(&painter, layer_view, l);
             }
             while marks.peek().is_some_and(|(layer, _, _)| *layer == l) {
-                let (layer, m, mark) = marks.next().unwrap();
+                let (_, _, mark) = marks.next().unwrap();
                 if self.paint_media_image(&painter, layer_view, &mark) {
                     continue;
                 }
@@ -1802,7 +2155,7 @@ impl Editor {
                     &mark,
                     layer_view,
                     false,
-                    state.selected.contains(&(layer, m)),
+                    false,
                     Some(&mut state.cache),
                 );
             }
@@ -1880,7 +2233,7 @@ impl Editor {
                 paint_width_handles(&painter, &self.doc.layers[l].frames[self.frame][m], view);
             }
         }
-        if matches!(tool, Tool::Node | Tool::Select) {
+        if matches!(tool, Tool::Node | Tool::Select) || tool == Tool::Pen && state.pen.is_none() {
             for &(l, m) in &state.selected {
                 let mark = &self.doc.layers[l].frames[self.frame][m];
                 if tool == Tool::Select && (!mark.stroke || mark.nodes.is_empty()) {
@@ -1929,54 +2282,107 @@ impl Editor {
                 }
             }
         }
-        if let Some(bounds) = state.bounds(self) {
-            if tool == Tool::Transform {
-                let mut points: Vec<Pos2> = [
+        if tool != Tool::Transform {
+            let mut evaluated = std::collections::HashMap::new();
+            for &(layer, mark_index) in &state.selected {
+                let marks = evaluated.entry(layer).or_insert_with(|| {
+                    crate::animation::marks(&self.doc.layers[layer], self.frame)
+                });
+                let Some(mark) = marks.get(mark_index) else {
+                    continue;
+                };
+                let local_view = self.camera_depth_view(self.camera_view(stage_view), layer);
+                if mark.style.instance.is_none() && mark.style.media_image.is_none() {
+                    if let Some((_, inside)) = state.partial.get(&(layer, mark_index)) {
+                        for part in inside {
+                            crate::paint::selection_pattern(
+                                &painter,
+                                part,
+                                local_view,
+                                &mut state.cache,
+                            );
+                        }
+                    } else {
+                        crate::paint::selection_pattern(
+                            &painter,
+                            mark,
+                            local_view,
+                            &mut state.cache,
+                        );
+                    }
+                    continue;
+                }
+                let mut bounds = crate::vector::control_bounds(mark);
+                let mut matrix = crate::rig::IDENTITY;
+                if let Some(instance) = &mark.style.instance
+                    && let Some(symbol_bounds) = self.animation_instance_bounds(mark)
+                {
+                    bounds = symbol_bounds;
+                    matrix = instance.matrix;
+                } else if mark.stroke {
+                    bounds = bounds.expand(mark.width * 0.5);
+                }
+                if !bounds.is_finite() {
+                    continue;
+                }
+                let padding = (2. / local_view.scale.max(0.001)).max(0.);
+                let bounds = bounds.expand(padding);
+                let corners = [
                     bounds.left_top(),
                     bounds.right_top(),
                     bounds.right_bottom(),
                     bounds.left_bottom(),
-                    bounds.left_top(),
                 ]
-                .into_iter()
-                .map(|p| view.screen(p))
-                .collect();
-                painter.add(egui::Shape::line(
-                    std::mem::take(&mut points),
-                    Stroke::new(1., crate::themes::accent()),
-                ));
-                if tool == Tool::Transform {
-                    for p in bounds.handles() {
-                        painter.rect_filled(
-                            Rect::from_center_size(view.screen(p), Vec2::splat(7.)),
-                            0.,
-                            Color32::from_rgb(32, 36, 43),
-                        );
-                        painter.rect_stroke(
-                            Rect::from_center_size(view.screen(p), Vec2::splat(7.)),
-                            0.,
-                            Stroke::new(1., crate::themes::accent()),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    let top = view.screen(bounds.center_top());
-                    let rot = top + rotate(Vec2::new(0., -30.), view.angle + bounds.angle);
-                    painter.line_segment([top, rot], Stroke::new(1., crate::themes::accent()));
-                    painter.circle_filled(rot, 5., Color32::from_rgb(32, 36, 43));
-                    painter.circle_stroke(rot, 5., Stroke::new(1.5, crate::themes::accent()));
-                    let pivot = view.screen(state.pivot.unwrap_or(bounds.center()));
-                    painter.circle_filled(pivot, 5., Color32::from_gray(28));
-                    painter.circle_stroke(pivot, 5., Stroke::new(1.5, crate::themes::accent()));
-                    painter.line_segment(
-                        [pivot - Vec2::new(8., 0.), pivot + Vec2::new(8., 0.)],
-                        Stroke::new(1., crate::themes::accent()),
-                    );
-                    painter.line_segment(
-                        [pivot - Vec2::new(0., 8.), pivot + Vec2::new(0., 8.)],
-                        Stroke::new(1., crate::themes::accent()),
-                    );
-                }
+                .map(|p| local_view.screen(crate::rig::point(matrix, p)));
+                paint_selection_outline(&painter, corners, mark.style.instance.is_some());
             }
+        }
+        if tool == Tool::Transform
+            && let Some(bounds) = state.bounds(self)
+        {
+            let corners = [
+                bounds.left_top(),
+                bounds.right_top(),
+                bounds.right_bottom(),
+                bounds.left_bottom(),
+            ]
+            .map(|p| view.screen(p));
+            let dashed = match state.selected.as_slice() {
+                [(l, m)] => self.doc.layers[*l].frames[self.frame]
+                    .get(*m)
+                    .is_some_and(|mark| mark.style.instance.is_some()),
+                _ => false,
+            };
+            paint_selection_outline(&painter, corners, dashed);
+            for p in bounds.handles() {
+                painter.rect_filled(
+                    Rect::from_center_size(view.screen(p), Vec2::splat(7.)),
+                    0.,
+                    Color32::from_rgb(32, 36, 43),
+                );
+                painter.rect_stroke(
+                    Rect::from_center_size(view.screen(p), Vec2::splat(7.)),
+                    0.,
+                    Stroke::new(1., crate::themes::accent()),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let top = view.screen(bounds.center_top());
+            let rot = top + rotate(Vec2::new(0., -30.), view.angle + bounds.angle);
+            painter.line_segment([top, rot], Stroke::new(1., crate::themes::accent()));
+            painter.circle_filled(rot, 5., Color32::from_rgb(32, 36, 43));
+            painter.circle_stroke(rot, 5., Stroke::new(1.5, crate::themes::accent()));
+            let pivot = view.screen(state.transform_pivot(self, bounds));
+            painter.circle_filled(pivot, 5., Color32::from_gray(28));
+            painter.circle_stroke(pivot, 5., Stroke::new(1.5, crate::themes::accent()));
+            painter.line_segment(
+                [pivot - Vec2::new(8., 0.), pivot + Vec2::new(8., 0.)],
+                Stroke::new(1., crate::themes::accent()),
+            );
+            painter.line_segment(
+                [pivot - Vec2::new(0., 8.), pivot + Vec2::new(0., 8.)],
+                Stroke::new(1., crate::themes::accent()),
+            );
         }
         if let Some(Drag::Marquee { start, end, .. }) = &state.drag {
             let r = Rect::from_two_pos(*start, *end);
@@ -2023,6 +2429,8 @@ impl Editor {
                 Stroke::new(1., crate::themes::accent()),
             ));
         }
+        self.paint_frame_workflow(&painter, view);
+        self.light_gizmo(ui, self.camera_view(stage_view), false);
         self.paint_folder_gizmo(&painter, self.camera_view(stage_view));
         self.paint_vector_trim(&painter, self.camera_view(stage_view));
         if raster_edit
@@ -2076,15 +2484,31 @@ impl Editor {
         {
             self.paint_snap_feedback(&painter, area, view);
         }
+        self.stage_mask(&painter, area, stage_view);
+        self.paint_preview_progress(&painter, area);
         if over
+            && !space
+            && !matches!(state.drag, Some(Drag::Pan(_)))
             && matches!(
                 tool,
                 Tool::Rectangle | Tool::Ellipse | Tool::Polygon | Tool::Line
             )
         {
             if let Some(pos) = pointer {
+                let cursor = ui.painter().with_clip_rect(area);
+                let on_stage = Rect::from_min_size(Pos2::ZERO, state.stage_size)
+                    .contains(stage_view.world(pos));
+                let (color, halo) = if on_stage {
+                    (Color32::BLACK, Color32::WHITE)
+                } else {
+                    (Color32::WHITE, Color32::BLACK)
+                };
+                for arm in [Vec2::new(7., 0.), Vec2::new(0., 7.)] {
+                    cursor.line_segment([pos - arm, pos + arm], Stroke::new(3., halo));
+                    cursor.line_segment([pos - arm, pos + arm], Stroke::new(1., color));
+                }
                 crate::design::draw(
-                    &painter,
+                    &cursor,
                     Rect::from_min_size(pos + Vec2::new(13., 13.), Vec2::splat(15.)),
                     tool.icon(),
                     crate::themes::accent(),
@@ -2092,8 +2516,8 @@ impl Editor {
             }
             response.clone().on_hover_text(crate::i18n::tr("Arrastra para crear la forma. Mayús mantiene la proporción o el ángulo; Alt omite los ajustes."));
         }
-        self.stage_mask(&painter, area, stage_view);
         self.paint_rulers(&ruler_painter, ruler_area, view);
+        self.command_helper_ui(ui, area);
         self.sync_selected_style(&state.selected);
         self.canvas = state;
         self.animation_canvas_drop(ui, area, view);
@@ -2146,6 +2570,29 @@ mod tests {
         assert!((out.points[1][0] + 20.).abs() < 0.001);
         assert!((out.points[1][1] - 50.).abs() < 0.001);
     }
+    #[test]
+    fn symbol_outline_dashes_are_visible_and_bounded_at_high_zoom() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let clip = Rect::from_min_max(Pos2::ZERO, Pos2::new(96., 64.));
+            paint_selection_outline(
+                &ui.painter().with_clip_rect(clip),
+                [
+                    Pos2::new(-1_000_000., 10.),
+                    Pos2::new(1_000_000., 10.),
+                    Pos2::new(1_000_000., 30.),
+                    Pos2::new(-1_000_000., 30.),
+                ],
+                true,
+            );
+        });
+        let count = output.shapes.iter().filter(|shape| {
+            matches!(&shape.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == SELECTION_BLUE)
+        }).count();
+        assert!((15..=32).contains(&count), "unexpected dash count: {count}");
+        output.textures_delta.clear();
+    }
+
     #[test]
     fn stroke_hit_tests_geometry_not_bounds() {
         assert!(hit(&mark(), Pos2::new(30., 40.), 2.));
@@ -2351,7 +2798,7 @@ impl SelectionBox {
             .contains(Pos2::ZERO + rotate(p.to_vec2(), -self.angle))
     }
 }
-fn transformed_in_basis(
+pub(crate) fn transformed_in_basis(
     m: &Mark,
     pivot: Pos2,
     scale: Vec2,
@@ -2454,6 +2901,8 @@ struct NodeDrag {
     start: Pos2,
     original: Mark,
     changed: bool,
+    moved: bool,
+    independent: bool,
 }
 
 impl Canvas {
@@ -2521,12 +2970,13 @@ impl Editor {
             return;
         }
         self.checkpoint();
-        let marks = self.prepare_style(self.symmetry_marks(vec![pen.mark]));
+        let marks = self.symmetry_marks(vec![pen.mark]);
+        let marks = self.prepare_style(marks);
         self.commit_paint(pen.layer, pen.frame, marks);
         self.recover();
         self.status = "Trazado Bézier creado".into();
     }
-    fn begin_pen(&mut self, state: &mut Canvas, world: Pos2, view: View) {
+    fn begin_pen(&mut self, state: &mut Canvas, world: Pos2, view: View, alt: bool) {
         state.pen_redo.clear();
         if state.pen.is_none() {
             if !self.stroke_enabled && !self.fill_enabled {
@@ -2549,6 +2999,21 @@ impl Editor {
             });
         }
         let pen = state.pen.as_mut().unwrap();
+        if alt
+            && let Some(index) = pen.mark.nodes.iter().position(|node| {
+                view.screen(crate::vector::pos(node.position))
+                    .distance(view.screen(world))
+                    < 9.
+            })
+        {
+            state.drag = Some(Drag::PenNode {
+                index,
+                start: world,
+                original: pen.mark.nodes[index].clone(),
+                convert: true,
+            });
+            return;
+        }
         if pen.mark.nodes.len() >= 2
             && view
                 .screen(crate::vector::pos(pen.mark.nodes[0].position))
@@ -2560,6 +3025,8 @@ impl Editor {
             state.drag = Some(Drag::PenNode {
                 index: 0,
                 start: world,
+                original: pen.mark.nodes[0].clone(),
+                convert: false,
             });
         } else {
             let index = pen.mark.nodes.len();
@@ -2569,11 +3036,13 @@ impl Editor {
             state.drag = Some(Drag::PenNode {
                 index,
                 start: world,
+                original: pen.mark.nodes[index].clone(),
+                convert: false,
             });
         }
         self.status="Pluma: clic crea esquina · arrastrar crea curva · primer nodo cierra · Enter termina · Esc cancela".into();
     }
-    fn start_node_drag(&mut self, state: &mut Canvas, world: Pos2, view: View) {
+    fn grab_selected_node(&self, state: &mut Canvas, world: Pos2, view: View, alt: bool) -> bool {
         let mut found = None;
         let mut best = 8.;
         for &(l, m) in &state.selected {
@@ -2602,11 +3071,19 @@ impl Editor {
             state.drag = Some(Drag::Node(NodeDrag {
                 id,
                 index,
-                handle,
+                handle: if alt && handle == 0 { 3 } else { handle },
                 start: self.depth_point(world, self.layer, id.0),
                 original: self.doc.layers[id.0].frames[self.frame][id.1].clone(),
                 changed: false,
+                moved: false,
+                independent: alt,
             }));
+            return true;
+        }
+        false
+    }
+    fn start_node_drag(&mut self, state: &mut Canvas, world: Pos2, view: View, alt: bool) {
+        if self.grab_selected_node(state, world, view, alt) {
             return;
         }
         'layers: for (l, layer) in self
@@ -2640,10 +3117,12 @@ impl Editor {
                         state.drag = Some(Drag::Node(NodeDrag {
                             id: (l, m),
                             index,
-                            handle: 0,
+                            handle: if alt { 3 } else { 0 },
                             start: self.depth_point(world, self.layer, l),
                             original: mark.clone(),
                             changed: false,
+                            moved: false,
+                            independent: alt,
                         }));
                     }
                     break 'layers;
@@ -2655,60 +3134,37 @@ impl Editor {
         if rect.width() < 0.001 || rect.height() < 0.001 {
             return;
         }
-        let mut edits = vec![];
-        let mut selected = vec![];
-        let mut changed = false;
-        for (l, layer) in self
-            .doc
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.visible && !l.options.locked && !l.options.raster)
-        {
-            let mut marks = Vec::new();
-            let mut layer_changed = false;
-            for (m, mark) in layer.frames[self.frame].iter().enumerate() {
-                let (outside, inside) = crate::vector::split_rect(mark, rect);
-                let partial = !outside.is_empty() && !inside.is_empty();
-                let previous = add && state.selected.contains(&(l, m));
-                if inside.is_empty() {
-                    if previous {
-                        selected.push((l, marks.len()));
-                    }
-                    marks.push(mark.clone());
-                } else if outside.is_empty() {
-                    selected.push((l, marks.len()));
-                    marks.push(mark.clone());
-                } else {
-                    layer_changed |= partial;
-                    changed |= partial;
-                    for part in outside {
-                        if previous {
-                            selected.push((l, marks.len()));
-                        }
-                        marks.push(part);
-                    }
-                    for part in inside {
-                        selected.push((l, marks.len()));
-                        marks.push(part);
-                    }
-                }
-            }
-            if layer_changed {
-                edits.push((l, marks));
-            }
-        }
-        if changed {
-            self.checkpoint();
-            for (l, marks) in edits {
-                self.doc.layers[l].frames[self.frame] = marks.into();
-            }
-            self.recover();
-            self.status = "Fragmento separado: puedes moverlo, transformarlo o borrarlo".into();
-        }
-        state.selected = selected;
+        self.select_fragments(state, add, |mark| crate::vector::split_rect(mark, rect));
         state.orientation = 0.;
         state.pivot = state.bounds(self).map(|b| b.center());
+    }
+    pub(crate) fn materialize_fragments(&mut self, state: &mut Canvas) {
+        if state.partial.is_empty() {
+            return;
+        }
+        self.materialize_motion(&state.selected);
+        let mut partial = std::mem::take(&mut state.partial);
+        let mut selected = std::mem::take(&mut state.selected);
+        selected.sort_unstable();
+        let mut shift = 0;
+        let mut layer = None;
+        for (l, m) in selected {
+            if layer != Some(l) {
+                shift = 0;
+                layer = Some(l);
+            }
+            let index = m + shift;
+            if let Some((outside, inside)) = partial.remove(&(l, m)) {
+                let start = index + outside.len();
+                let end = start + inside.len();
+                self.doc.layers[l].frames[self.frame]
+                    .splice(index..index + 1, outside.into_iter().chain(inside));
+                state.selected.extend((start..end).map(|m| (l, m)));
+                shift += end - index - 1;
+            } else {
+                state.selected.push((l, index));
+            }
+        }
     }
     pub(crate) fn separate_component(
         &mut self,
@@ -2753,6 +3209,8 @@ impl Editor {
         for &(l, m) in &ids {
             let mark = &mut self.doc.layers[l].frames[self.frame][m];
             mark.color = self.color.to_array();
+            mark.style.palette_stroke = None;
+            mark.style.palette_fill = None;
             mark.width = self.width;
             mark.width_profile = self.width_profile.clone();
             mark.stroke = self.stroke_enabled;
@@ -2800,6 +3258,9 @@ fn move_node(original: &Mark, index: usize, handle: u8, delta: Vec2, independent
         node.position = crate::vector::xy(anchor + delta);
         node.in_handle = crate::vector::xy(crate::vector::pos(node.in_handle) + delta);
         node.out_handle = crate::vector::xy(crate::vector::pos(node.out_handle) + delta);
+    } else if handle == 3 && node.in_handle == node.position && node.out_handle == node.position {
+        node.in_handle = crate::vector::xy(anchor - delta);
+        node.out_handle = crate::vector::xy(anchor + delta);
     } else {
         let (moved, opposite) = if handle == 1 {
             (&mut node.in_handle, &mut node.out_handle)
@@ -2887,6 +3348,15 @@ mod vector_gesture_tests {
         }
     }
     fn tick(ctx: &egui::Context, e: &mut Editor, events: Vec<egui::Event>) {
+        tick_with_modifiers(ctx, e, events, egui::Modifiers::NONE);
+    }
+    fn tick_with_modifiers(
+        ctx: &egui::Context,
+        e: &mut Editor,
+        mut events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) {
+        events.insert(0, egui::Event::ModifiersChanged(modifiers));
         let mut out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000., 700.))),
@@ -2931,9 +3401,56 @@ mod vector_gesture_tests {
         });
     }
     #[test]
+    fn vector_brush_records_two_document_pixels_at_different_zooms() {
+        use geo::BoundingRect;
+        run(|ctx, e| {
+            e.tool = Tool::VectorBrush;
+            e.width = 2.;
+            let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000., 700.));
+            let draw = |editor: &mut Editor, zoom, pressure| {
+                editor.canvas.zoom = zoom;
+                editor.drawing.pen.test_pressure(Some(pressure));
+                let view = editor.canvas.view(area);
+                let a = view.screen(Pos2::new(420., 270.));
+                let b = view.screen(Pos2::new(540., 270.));
+                tick(
+                    ctx,
+                    editor,
+                    vec![egui::Event::PointerMoved(a), button(a, true)],
+                );
+                tick(ctx, editor, vec![egui::Event::PointerMoved(b)]);
+                tick(
+                    ctx,
+                    editor,
+                    vec![
+                        button(b, false),
+                        egui::Event::PointerMoved(b + Vec2::Y * 20.),
+                    ],
+                );
+            };
+            draw(e, 0.5, 0.2);
+            draw(e, 2., 0.7);
+            assert_eq!(e.doc.layers[0].frames[0].len(), 2);
+            for mark in &e.doc.layers[0].frames[0] {
+                assert_eq!(mark.width, 2.);
+                assert!(mark.width_profile.is_empty());
+                let outline = crate::width::outline(mark).bounding_rect().unwrap();
+                assert!((outline.height() - 2.).abs() < 0.001, "{outline:?}");
+            }
+            e.drawing.vector_pressure = true;
+            draw(e, 2., 0.5);
+            let mark = &e.doc.layers[0].frames[0][2];
+            let outline = crate::width::outline(mark).bounding_rect().unwrap();
+            assert!((outline.height() - 1.).abs() < 0.001, "{outline:?}");
+        });
+    }
+
+    #[test]
     fn all_pointer_samples_in_one_frame_survive_vector_brush_completion() {
         run(|ctx, e| {
             e.tool = Tool::VectorBrush;
+            e.color = Color32::BLUE;
+            e.fill_color = Color32::RED;
             let a = Pos2::new(200., 200.);
             let middle = Pos2::new(350., 380.);
             let b = Pos2::new(500., 200.);
@@ -2954,10 +3471,47 @@ mod vector_gesture_tests {
             let mark = &e.doc.layers[0].frames[0][0];
             assert!(!mark.nodes.is_empty());
             assert!(mark.stroke && mark.fill.is_none());
+            assert_eq!(mark.color, Color32::RED.to_array());
             let bounds = crate::vector::control_bounds(mark);
             assert!(bounds.height() > 130., "{bounds:?}");
         });
     }
+    #[test]
+    fn pen_alt_click_converts_existing_curve_without_adding_an_anchor() {
+        run(|ctx, e| {
+            e.tool = Tool::Pen;
+            let anchor = Pos2::new(200., 200.);
+            let handle = Pos2::new(235., 170.);
+            tick(
+                ctx,
+                e,
+                vec![egui::Event::PointerMoved(anchor), button(anchor, true)],
+            );
+            tick(ctx, e, vec![egui::Event::PointerMoved(handle)]);
+            tick(ctx, e, vec![button(handle, false)]);
+            let alt = egui::Modifiers::ALT;
+            tick_with_modifiers(
+                ctx,
+                e,
+                vec![egui::Event::PointerMoved(anchor), button(anchor, true)],
+                alt,
+            );
+            tick_with_modifiers(ctx, e, vec![button(anchor, false)], alt);
+            let pen = e.canvas.pen.as_ref().unwrap();
+            assert_eq!(pen.mark.nodes.len(), 1);
+            let node = &pen.mark.nodes[0];
+            assert_eq!(node.position, node.in_handle);
+            assert_eq!(node.position, node.out_handle);
+            let handle = Pos2::new(230., 215.);
+            tick_with_modifiers(ctx, e, vec![button(anchor, true)], alt);
+            tick_with_modifiers(ctx, e, vec![egui::Event::PointerMoved(handle)], alt);
+            tick_with_modifiers(ctx, e, vec![button(handle, false)], alt);
+            let node = &e.canvas.pen.as_ref().unwrap().mark.nodes[0];
+            assert_ne!(node.position, node.in_handle);
+            assert_ne!(node.position, node.out_handle);
+        });
+    }
+
     #[test]
     fn pen_click_drag_creates_real_handles_and_enter_finishes_open_path() {
         run(|ctx, e| {
@@ -3034,11 +3588,26 @@ mod vector_gesture_tests {
             let b = view.screen(Pos2::new(350., 250.));
             tick(ctx, e, vec![egui::Event::PointerMoved(a), button(a, true)]);
             tick(ctx, e, vec![egui::Event::PointerMoved(b), button(b, false)]);
-            assert!(e.doc.layers[0].frames[0].len() >= 2);
+            assert_eq!(e.doc.layers[0].frames[0].len(), 1);
             assert!(!e.canvas.selected.is_empty());
             let (l, m) = e.canvas.selected[0];
-            let selected = &e.doc.layers[l].frames[0][m];
+            let selected = &e.canvas.partial[&(l, m)].1[0];
             assert!(crate::vector::control_bounds(selected).max.x < 400.);
+            let inside = view.screen(Pos2::new(275., 175.));
+            let moved = view.screen(Pos2::new(325., 175.));
+            tick(
+                ctx,
+                e,
+                vec![egui::Event::PointerMoved(inside), button(inside, true)],
+            );
+            assert_eq!(e.doc.layers[0].frames[0].len(), 1);
+            tick(
+                ctx,
+                e,
+                vec![egui::Event::PointerMoved(moved), button(moved, false)],
+            );
+            assert!(e.doc.layers[0].frames[0].len() >= 2);
+            assert!(e.canvas.partial.is_empty());
         });
     }
 }
@@ -3121,49 +3690,340 @@ impl Editor {
             }));
         }
     }
-    fn bucket_at(&mut self, state: &mut Canvas, world: Pos2) {
+    fn bucket_at(&mut self, state: &mut Canvas, world: Pos2, recalculate: bool) {
         if !self.fill_enabled {
             self.status = "Activa un color de relleno".into();
             return;
         }
-        match crate::bucket::fill(
-            &self.doc.layers[self.layer].frames[self.frame],
+        let layer = self.layer;
+        let frame = self.frame;
+        let marks = &self.doc.layers[layer].frames[frame];
+        match bucket_edit(
+            marks,
             world,
+            recalculate,
             self.gap,
             self.fill_color.to_array(),
         ) {
-            Ok(shapes) => {
-                let shapes = self.prepare_style(shapes);
-                // Recolor an existing bucket face when its geometry is unchanged.
-                let old = self.doc.layers[self.layer].frames[self.frame]
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, m)| m.bucket && crate::vector::contains_fill(m, world))
-                    .map(|(i, _)| i);
+            Ok(edit) => {
                 self.checkpoint();
-                self.prepare_paint_key(self.layer, self.frame);
+                self.prepare_paint_key(layer, frame);
+                self.apply_bucket_edit(
+                    layer,
+                    frame,
+                    edit,
+                    self.feature.gradient_on,
+                    self.feature.gradient.clone(),
+                );
                 state.clear_selection();
-                if let Some(index) = old.filter(|&i| {
-                    let previous = &self.doc.layers[self.layer].frames[self.frame][i];
-                    shapes.len() == 1
-                        && previous.points == shapes[0].points
-                        && previous.holes == shapes[0].holes
-                }) {
-                    self.doc.layers[self.layer].frames[self.frame][index].fill =
-                        Some(self.fill_color.to_array());
-                    self.doc.layers[self.layer].frames[self.frame][index].style =
-                        shapes[0].style.clone();
-                } else {
-                    self.doc.layers[self.layer].frames[self.frame].splice(0..0, shapes);
-                }
                 self.recover();
                 self.status = "Relleno aplicado".into();
             }
             Err(error) => self.status = error,
         }
     }
+
+    fn apply_bucket_edit(
+        &mut self,
+        layer: usize,
+        frame: usize,
+        edit: BucketEdit,
+        gradient_on: bool,
+        gradient: crate::features::Gradient,
+    ) {
+        let fit_gradient = |mark: &Mark| {
+            gradient_on.then(|| {
+                let mut gradient = gradient.clone();
+                gradient.fit(crate::vector::control_bounds(mark));
+                gradient
+            })
+        };
+        match edit {
+            BucketEdit::Recolor { index, color } => {
+                let link = (!gradient_on)
+                    .then(|| self.track_vector_color(color))
+                    .flatten();
+                let marks = &mut self.doc.layers[layer].frames[frame];
+                let mark = &mut marks[index];
+                mark.fill = Some(color);
+                mark.style.palette_fill = link;
+                mark.style.gradient = fit_gradient(mark);
+                mark.style.shade = 0;
+                mark.style.light = 0;
+            }
+            BucketEdit::Replace {
+                shapes,
+                replaced,
+                outline,
+            } => {
+                let mut shapes = shapes;
+                let bounds = shapes.iter().fold(Rect::NOTHING, |bounds, mark| {
+                    bounds.union(crate::vector::control_bounds(mark))
+                });
+                for shape in &mut shapes {
+                    shape.style.start_cap = self.feature.start_cap;
+                    shape.style.end_cap = self.feature.end_cap;
+                    shape.style.gradient = gradient_on.then(|| {
+                        let mut gradient = gradient.clone();
+                        gradient.fit(bounds);
+                        gradient
+                    });
+                    self.link_drawn_colors(shape);
+                }
+                let marks = &mut self.doc.layers[layer].frames[frame];
+                if let Some(index) = outline {
+                    marks[index].fill = None;
+                    marks[index].style.palette_fill = None;
+                    marks[index].style.gradient = None;
+                }
+                for index in replaced.into_iter().rev() {
+                    marks.remove(index);
+                }
+                marks.splice(0..0, shapes);
+            }
+        }
+    }
+
+    fn start_bucket_range(&mut self, ctx: &egui::Context, world: Pos2, recalculate: bool) {
+        if self.feature.bucket_range.is_some() || !self.fill_enabled {
+            return;
+        }
+        let confirm = std::mem::take(&mut self.feature.bucket_range_armed);
+        let layer = self.layer;
+        let snapshot = self.doc.layers.clone();
+        let source = &snapshot[layer];
+        let frames: Vec<_> = if confirm {
+            let Some((_, a, b)) = self
+                .feature
+                .frame_selection
+                .filter(|selection| selection.0 == layer)
+            else {
+                return;
+            };
+            (a.min(b)..=a.max(b).min(source.frames.len() - 1))
+                .filter(|frame| source.key(*frame))
+                .take(33)
+                .collect()
+        } else {
+            following_bucket_keys(source, self.frame, self.feature.bucket_next_count)
+        };
+        if confirm && frames.len() > 32 {
+            self.status = crate::i18n::tr("Select a range with at most 32 keyframes.").into();
+            return;
+        }
+        if frames.is_empty() {
+            self.status = crate::i18n::tr("No keyframes to fill").into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_snapshot = snapshot.clone();
+        let current_pose =
+            (!confirm && !source.key(self.frame) && self.studio.prefs.auto_key_paint)
+                .then(|| (self.frame, crate::animation::marks(source, self.frame)));
+        let color = self.fill_color.to_array();
+        let gap = self.gap;
+        let ctx = ctx.clone();
+        self.feature.bucket_range = Some(BucketRange {
+            layer,
+            snapshot,
+            confirm,
+            start_frame: self.frame,
+            result: None,
+            pending: rx,
+            gradient_on: self.feature.gradient_on,
+            gradient: self.feature.gradient.clone(),
+        });
+        std::thread::spawn(move || {
+            let edits = frames
+                .into_iter()
+                .map(|frame| {
+                    let marks = current_pose
+                        .as_ref()
+                        .filter(|(current, _)| *current == frame)
+                        .map_or(&worker_snapshot[layer].frames[frame], |(_, marks)| marks);
+                    (frame, bucket_edit(marks, world, recalculate, gap, color))
+                })
+                .collect();
+            let _ = tx.send(edits);
+            ctx.request_repaint();
+        });
+    }
+
+    fn bucket_range_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut batch) = self.feature.bucket_range.take() else {
+            return;
+        };
+        if batch.snapshot.identity() != self.doc.layers.identity() {
+            return;
+        }
+        if batch.result.is_none() {
+            match batch.pending.try_recv() {
+                Ok(result) => batch.result = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let mut open = true;
+        let mut apply = !batch.confirm && batch.result.is_some();
+        if batch.confirm {
+            egui::Window::new(crate::i18n::tr("Fill selected keyframes"))
+                .id(egui::Id::unique("bucket-range-preview"))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(edits) = &batch.result {
+                        egui::ScrollArea::vertical()
+                            .max_height(260.)
+                            .show(ui, |ui| {
+                                for (frame, edit) in edits {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{:03}", frame + 1));
+                                        if let Err(error) = edit {
+                                            ui.label(crate::i18n::tr(error));
+                                        } else {
+                                            ui.label(crate::i18n::tr("Fill ready"));
+                                        }
+                                    });
+                                }
+                            });
+                        if crate::design::button(
+                            ui,
+                            Icon::Bucket,
+                            "Apply fills",
+                            "Apply fills",
+                            false,
+                            edits.iter().any(|(_, edit)| edit.is_ok()),
+                        )
+                        .clicked()
+                        {
+                            apply = true;
+                        }
+                    } else {
+                        ui.spinner();
+                    }
+                });
+        }
+        if apply && let Some(edits) = batch.result {
+            let count = edits.iter().filter(|(_, edit)| edit.is_ok()).count();
+            if count == 0 {
+                self.status = edits
+                    .into_iter()
+                    .find_map(|(_, edit)| edit.err())
+                    .unwrap_or_default();
+                return;
+            }
+            let total = edits.len();
+            self.checkpoint();
+            for (frame, edit) in edits {
+                if let Ok(edit) = edit {
+                    if !batch.confirm && frame == batch.start_frame {
+                        self.prepare_paint_key(batch.layer, frame);
+                    }
+                    self.apply_bucket_edit(
+                        batch.layer,
+                        frame,
+                        edit,
+                        batch.gradient_on,
+                        batch.gradient.clone(),
+                    );
+                    let layer = &mut self.doc.layers[batch.layer];
+                    let marks = layer.frames[frame].clone();
+                    for held in layer.exposure(frame) {
+                        layer.frames[held] = marks.clone();
+                    }
+                }
+            }
+            self.recover();
+            self.status = format!("{} {count}/{total}", crate::i18n::tr("Keyframes filled"));
+        } else if open {
+            if !batch.confirm {
+                self.status = crate::i18n::tr("Filling keyframes…").into();
+            }
+            self.feature.bucket_range = Some(batch);
+        }
+    }
 }
+
+fn following_bucket_keys(layer: &crate::document::Layer, frame: usize, count: usize) -> Vec<usize> {
+    std::iter::once(frame)
+        .chain(
+            (frame.saturating_add(1)..layer.frames.len())
+                .filter(|frame| layer.key(*frame))
+                .take(count.clamp(1, 32)),
+        )
+        .collect()
+}
+
+enum BucketEdit {
+    Recolor {
+        index: usize,
+        color: [u8; 4],
+    },
+    Replace {
+        shapes: Vec<Mark>,
+        replaced: Vec<usize>,
+        outline: Option<usize>,
+    },
+}
+
+type BucketEdits = Vec<(usize, Result<BucketEdit, String>)>;
+
+pub(crate) struct BucketRange {
+    layer: usize,
+    confirm: bool,
+    start_frame: usize,
+    snapshot: crate::shared::SharedVec<crate::document::Layer>,
+    gradient_on: bool,
+    gradient: crate::features::Gradient,
+    pending: std::sync::mpsc::Receiver<BucketEdits>,
+    result: Option<BucketEdits>,
+}
+
+fn bucket_edit(
+    marks: &[Mark],
+    world: Pos2,
+    recalculate: bool,
+    gap: crate::bucket::Gap,
+    color: [u8; 4],
+) -> Result<BucketEdit, String> {
+    let existing = marks.iter().rposition(|mark| {
+        mark.style.instance.is_none()
+            && mark.style.media_image.is_none()
+            && !mark.style.raster_tile
+            && !mark.style.guide
+            && mark.fill.is_some()
+            && crate::vector::control_bounds(mark).contains(world)
+            && crate::vector::contains_fill(mark, world)
+    });
+    if !recalculate && let Some(index) = existing {
+        return Ok(BucketEdit::Recolor { index, color });
+    }
+    let shapes = if let Some(index) = existing.filter(|&index| !marks[index].bucket) {
+        let mut contours = marks.to_vec();
+        if contours[index].stroke {
+            contours[index].fill = None;
+        } else {
+            contours.remove(index);
+        }
+        crate::bucket::fill(&contours, world, gap, color)?
+    } else {
+        crate::bucket::fill(marks, world, gap, color)?
+    };
+    let mut replaced = crate::bucket::covered_bucket_fills(marks, &shapes);
+    let outline = existing.filter(|&index| marks[index].stroke);
+    if let Some(index) = existing
+        && outline.is_none()
+        && !replaced.contains(&index)
+    {
+        replaced.push(index);
+        replaced.sort_unstable();
+    }
+    Ok(BucketEdit::Replace {
+        shapes,
+        replaced,
+        outline,
+    })
+}
+
 fn paint_width_handles(p: &egui::Painter, mark: &Mark, view: View) {
     let controls = if mark.width_profile.is_empty() {
         crate::width::Preset::Custom.stops()
@@ -3262,6 +4122,21 @@ mod styling_gesture_tests {
         });
     }
     #[test]
+    fn next_bucket_keyframes_include_current_and_skip_other_held_frames() {
+        let mut doc = crate::Document::default();
+        let layer = &mut doc.layers[0];
+        layer.init_keys();
+        layer.options.keys.fill(false);
+        for key in [0, 3, 7, 9] {
+            layer.options.keys[key] = true;
+        }
+        assert_eq!(following_bucket_keys(layer, 0, 2), vec![0, 3, 7]);
+        assert_eq!(following_bucket_keys(layer, 1, 2), vec![1, 3, 7]);
+        assert_eq!(following_bucket_keys(layer, 3, 2), vec![3, 7, 9]);
+        assert_eq!(following_bucket_keys(layer, 9, 2), vec![9]);
+    }
+
+    #[test]
     fn bucket_click_creates_vector_fill_and_recolor_does_not_accumulate_faces() {
         run(|ctx, e| {
             e.doc.layers[0].frames[0].push(Mark {
@@ -3284,6 +4159,9 @@ mod styling_gesture_tests {
             tick(ctx, e, vec![button(point, false)]);
             assert_eq!(e.doc.layers[0].frames[0].len(), 2);
             assert!(e.doc.layers[0].frames[0][0].bucket);
+            // A legacy fill may stop short of the real contour.
+            e.doc.layers[0].frames[0][0].points = vec![[250., 225.], [350., 275.]].into();
+            e.doc.layers[0].frames[0][0].rectangle = true;
             e.fill_color = Color32::RED;
             tick(ctx, e, vec![button(point, true)]);
             tick(ctx, e, vec![button(point, false)]);
@@ -3292,6 +4170,18 @@ mod styling_gesture_tests {
                 e.doc.layers[0].frames[0][0].fill,
                 Some(Color32::RED.to_array())
             );
+            assert_eq!(
+                &*e.doc.layers[0].frames[0][0].points,
+                &[[250., 225.], [350., 275.]]
+            );
+            let mut canvas = std::mem::take(&mut e.canvas);
+            e.bucket_at(&mut canvas, Pos2::new(300., 250.), true);
+            e.canvas = canvas;
+            assert_eq!(e.doc.layers[0].frames[0].len(), 2);
+            assert!(crate::vector::contains_fill(
+                &e.doc.layers[0].frames[0][0],
+                Pos2::new(225., 250.),
+            ));
         });
     }
 }
@@ -3369,6 +4259,49 @@ mod new_tool_regressions {
         tick(ctx, e, vec![button(p, false)]);
     }
     #[test]
+    fn symbol_pivot_survives_deselection_and_serialization_without_moving_art() {
+        run(|ctx, editor| {
+            editor.doc.layers[0].frames[0].push(rect(
+                [200., 160.],
+                [360., 320.],
+                [20, 60, 90, 255],
+            ));
+            editor.canvas.selected = vec![(0, 0)];
+            editor.convert_symbol();
+            editor.tool = Tool::Transform;
+            let before = editor.doc.layers[0].frames[0][0]
+                .style
+                .instance
+                .as_ref()
+                .unwrap()
+                .matrix;
+            let v = view(editor);
+            let bounds = editor.canvas.bounds(editor).unwrap();
+            let from = v.screen(bounds.center());
+            let to = from + Vec2::new(35., 15.);
+            tick(
+                ctx,
+                editor,
+                vec![egui::Event::PointerMoved(from), button(from, true)],
+            );
+            tick(ctx, editor, vec![egui::Event::PointerMoved(to)]);
+            tick(ctx, editor, vec![button(to, false)]);
+            let mark = &editor.doc.layers[0].frames[0][0];
+            assert_eq!(mark.style.instance.as_ref().unwrap().matrix, before);
+            assert!(mark.style.symbol_pivot.is_some());
+            editor.doc = serde_json::from_slice(&serde_json::to_vec(&editor.doc).unwrap()).unwrap();
+            editor.canvas.clear_selection();
+            editor.canvas.selected.push((0, 0));
+            let bounds = editor.canvas.bounds(editor).unwrap();
+            assert!(
+                v.screen(editor.canvas.transform_pivot(editor, bounds))
+                    .distance(to)
+                    < 0.01
+            );
+        });
+    }
+
+    #[test]
     fn camera_drag_moves_art_with_pointer_and_records_local_key() {
         run(|ctx, e| {
             e.doc = crate::fresh_document();
@@ -3403,6 +4336,49 @@ mod new_tool_regressions {
             assert!(e.project_document().validate().is_ok());
         });
     }
+    #[test]
+    fn wheel_zoom_keeps_camera_and_parallax_art_anchored_to_cursor() {
+        run(|ctx, e| {
+            e.doc = crate::fresh_document();
+            e.add_camera();
+            let camera = &mut e.doc.extras.cameras[0];
+            camera.zoom = 2.5;
+            camera.center = [1100., 600.];
+            camera.angle = 0.4;
+            e.doc.layers[0].options.depth.distance = 450.;
+            e.doc.layers[0].options.depth.keep_size = false;
+            let camera_before = serde_json::to_value(&e.doc.extras.cameras).unwrap();
+            let pointer = Pos2::new(730., 240.);
+            for tool in [Tool::Camera, Tool::Select] {
+                e.tool = tool;
+                e.studio.stage_only = tool == Tool::Select;
+                e.canvas.fit();
+                tick(ctx, e, vec![egui::Event::PointerMoved(pointer)]);
+                let anchor = e.canvas_edit_view(view(e)).world(pointer);
+                for _ in 0..3 {
+                    let zoom_before = e.canvas.zoom;
+                    tick(
+                        ctx,
+                        e,
+                        vec![egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                            delta: Vec2::new(0., 110.),
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    );
+                    assert!(e.canvas.zoom > zoom_before);
+                    assert!(e.canvas_edit_view(view(e)).screen(anchor).distance(pointer) < 0.01);
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&e.doc.extras.cameras).unwrap(),
+                camera_before
+            );
+        });
+    }
+
     #[test]
     fn moving_held_art_edits_exposure_without_creating_motion() {
         run(|ctx, e| {
@@ -3490,22 +4466,33 @@ mod new_tool_regressions {
     fn crossing_selection_deletes_only_the_chosen_segment_and_saves_curves() {
         run(|ctx, e| {
             e.tool = Tool::Select;
-            e.doc.layers[0].frames[0].push(Mark {
-                points: vec![[100., 200.], [500., 200.]].into(),
-                width_profile: crate::width::Preset::Tapered.stops(),
-                ..Default::default()
-            });
+            let curve = crate::vector::Cubic([
+                Pos2::new(100., 200.),
+                Pos2::new(210., 150.),
+                Pos2::new(390., 250.),
+                Pos2::new(500., 200.),
+            ]);
+            e.doc.layers[0].frames[0].push(crate::vector::from_cubics(
+                &[curve],
+                &Mark {
+                    width_profile: crate::width::Preset::Tapered.stops(),
+                    ..Default::default()
+                },
+            ));
             e.doc.layers[0].frames[0].push(Mark {
                 points: vec![[300., 100.], [300., 300.]].into(),
                 ..Default::default()
             });
-            let p = view(e).screen(Pos2::new(180., 200.));
-            click(ctx, e, p);
-            assert_eq!(e.doc.layers[0].frames[0].len(), 3);
+            let p = view(e).screen(curve.at(0.2));
+            let original = e.doc.layers[0].frames[0].clone();
+            tick(ctx, e, vec![egui::Event::PointerMoved(p), button(p, true)]);
+            tick(ctx, e, vec![button(p + Vec2::new(0., -0.5), false)]);
+            assert!(e.doc.layers[0].frames[0] == original);
+            assert!(e.undo.is_empty());
             assert_eq!(e.canvas.selected.len(), 1);
-            let (l, m) = e.canvas.selected[0];
+            let id = e.canvas.selected[0];
             assert!(
-                crate::vector::control_bounds(&e.doc.layers[l].frames[0][m])
+                crate::vector::control_bounds(&e.canvas.partial[&id].1[0])
                     .max
                     .x
                     < 301.
@@ -3530,11 +4517,41 @@ mod new_tool_regressions {
             let copy = crate::fla::decode(&crate::fla::encode(&e.doc).unwrap()).unwrap();
             assert_eq!(copy.layers[0].frames[0].len(), 2);
             e.history(false);
-            assert_eq!(e.doc.layers[0].frames[0].len(), 3);
+            assert!(e.doc.layers[0].frames[0] == original);
         });
     }
     #[test]
-    fn lasso_and_polygon_select_cut_real_areas_with_undo() {
+    fn double_click_selects_the_connected_strokes_but_not_a_separate_line() {
+        run(|ctx, e| {
+            e.tool = Tool::Select;
+            for points in [
+                [[100., 200.], [500., 200.]],
+                [[300., 100.], [300., 300.]],
+                [[100., 350.], [500., 350.]],
+            ] {
+                e.doc.layers[0].frames[0].push(Mark {
+                    points: points.to_vec().into(),
+                    ..Default::default()
+                });
+            }
+            let p = view(e).screen(Pos2::new(180., 200.));
+            tick(ctx, e, vec![egui::Event::PointerMoved(p)]);
+            click(ctx, e, p);
+            click(ctx, e, p);
+            assert!(ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary)));
+            assert!(e.canvas.selected.iter().any(|&(_, m)| {
+                crate::vector::control_bounds(&e.doc.layers[0].frames[0][m]).height() > 100.
+            }));
+            assert!(e.canvas.selected.iter().all(|&(_, m)| {
+                crate::vector::control_bounds(&e.doc.layers[0].frames[0][m])
+                    .min
+                    .y
+                    < 350.
+            }));
+        });
+    }
+    #[test]
+    fn lasso_and_polygon_defer_cut_until_edit_and_undo_it() {
         run(|ctx, e| {
             for tool in [Tool::Lasso, Tool::PolygonSelect] {
                 e.doc = crate::Document::default();
@@ -3587,9 +4604,8 @@ mod new_tool_regressions {
                     .canvas
                     .selected
                     .iter()
-                    .map(|&(l, m)| {
-                        crate::vector::polygon(&e.doc.layers[l].frames[0][m]).unsigned_area()
-                    })
+                    .flat_map(|id| &e.canvas.partial[id].1)
+                    .map(|mark| crate::vector::polygon(mark).unsigned_area())
                     .sum();
                 assert!((selected - 20000.).abs() < 2., "{} {selected}", tool.name());
                 let total: f64 = e.doc.layers[0].frames[0]
@@ -3597,6 +4613,13 @@ mod new_tool_regressions {
                     .map(|m| crate::vector::polygon(m).unsigned_area())
                     .sum();
                 assert!((total - 90000.).abs() < 2.);
+                assert_eq!(e.doc.layers[0].frames[0].len(), 1);
+                e.copy_selection(true);
+                let remainder: f64 = e.doc.layers[0].frames[0]
+                    .iter()
+                    .map(|mark| crate::vector::polygon(mark).unsigned_area())
+                    .sum();
+                assert!((remainder - 70000.).abs() < 2.);
                 e.history(false);
                 assert_eq!(e.doc.layers[0].frames[0].len(), 1);
             }
@@ -3828,6 +4851,43 @@ mod new_tool_regressions {
         });
     }
     #[test]
+    fn eyedropper_samples_transformed_bitmap_and_ignores_transparent_pixels() {
+        run(|ctx, e| {
+            e.doc.layers[0].frames[0].push(rect([100., 100.], [300., 300.], [30, 40, 50, 255]));
+            let asset = crate::media::bitmap(
+                vec![210, 20, 40, 255, 0, 200, 0, 0],
+                2,
+                1,
+                "Pasted image".into(),
+            );
+            let mut image = Mark {
+                points: vec![[240., 120.], [240., 260.], [120., 260.], [120., 120.]].into(),
+                fill: Some([0; 4]),
+                stroke: false,
+                closed: true,
+                ..Mark::default()
+            };
+            image.style.media_image = Some(asset.id);
+            e.doc.extras.media.assets.push(asset);
+            e.doc.layers[0].frames[0].push(image);
+            e.activate_tool(Tool::Eyedropper);
+            let view = view(e);
+            click(ctx, e, view.screen(Pos2::new(180., 150.)));
+            assert_eq!(e.fill_color, Color32::from_rgb(210, 20, 40));
+            click(ctx, e, view.screen(Pos2::new(180., 230.)));
+            assert_eq!(e.fill_color, Color32::from_rgb(30, 40, 50));
+
+            e.activate_tool(Tool::Brush);
+            let fill = e.fill_color;
+            e.studio.color_picker = Some(false);
+            click(ctx, e, view.screen(Pos2::new(180., 150.)));
+            assert_eq!(e.color, Color32::from_rgb(210, 20, 40));
+            assert_eq!(e.fill_color, fill);
+            assert_eq!(e.doc.layers[0].frames[0].len(), 2);
+            assert!(e.undo.is_empty());
+        });
+    }
+    #[test]
     fn wand_eyedropper_and_connected_object_selection_are_distinct() {
         run(|ctx, e| {
             e.doc.layers[0].frames[0].extend([
@@ -4046,7 +5106,7 @@ mod shape_feedback_regressions {
         let a = view.screen(Pos2::new(103., 98.));
         let b = view.screen(Pos2::new(197., 202.));
         let (_, cursor) = tick(&mut e, vec![egui::Event::PointerMoved(a)]);
-        assert_eq!(cursor, CursorIcon::Crosshair);
+        assert_eq!(cursor, CursorIcon::None);
         let press = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: PointerButton::Primary,

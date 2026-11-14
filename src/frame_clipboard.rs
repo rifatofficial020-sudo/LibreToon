@@ -134,6 +134,18 @@ impl Remap {
         if let Some(i) = &mut out.style.instance {
             i.symbol = self.symbols[&i.symbol];
         }
+        out.style.mouth_routes.retain(|route| {
+            route
+                .path
+                .iter()
+                .all(|slot| self.symbols.contains_key(&slot.symbol))
+        });
+        for route in &mut out.style.mouth_routes {
+            for slot in &mut route.path {
+                slot.symbol = self.symbols[&slot.symbol];
+                slot.track = mapped(&mut self.tracks, slot.track);
+            }
+        }
         if let Some(i) = &mut out.style.media_image {
             *i = self.media[i];
         }
@@ -152,6 +164,9 @@ impl Remap {
     }
     fn rig(&mut self, rig: &crate::rig::Rig) -> crate::rig::Rig {
         let mut out = rig.clone();
+        out.character_symbol = out
+            .character_symbol
+            .and_then(|id| self.symbols.get(&id).copied());
         for bone in &mut out.bones {
             bone.id = mapped(&mut self.bones, bone.id);
             bone.parent = bone.parent.map(|id| mapped(&mut self.bones, id));
@@ -171,6 +186,14 @@ impl Remap {
                 pin.id = mapped(&mut self.pins, pin.id);
             }
         }
+        for channel in [&mut out.character_turns.head, &mut out.character_turns.body] {
+            channel.root = channel.root.map(|id| mapped(&mut self.bones, id));
+            for pose in channel.views.iter_mut().flatten() {
+                for (id, _) in &mut std::sync::Arc::make_mut(pose).bones {
+                    *id = mapped(&mut self.bones, *id);
+                }
+            }
+        }
         out
     }
     fn symbol(&mut self, symbol: &Symbol) -> Symbol {
@@ -182,6 +205,12 @@ impl Remap {
             folder.parent = folder.parent.map(|p| mapped(&mut self.folders, p));
         }
         for layer in &mut out.layers {
+            if let Some(piece) = &mut layer.options.character_piece {
+                piece.remap(
+                    |id| mapped(&mut self.tracks, id),
+                    |id| mapped(&mut self.bones, id),
+                );
+            }
             layer.options.folder = layer.options.folder.map(|f| mapped(&mut self.folders, f));
             layer.frames = layer.frames.iter().map(|frame| self.frame(frame)).collect();
         }
@@ -335,6 +364,7 @@ impl Editor {
                 layers,
                 rig,
                 library_folder: None,
+                mouth_poses: Default::default(),
                 folders: Default::default(),
                 perspective: source.extras.perspective.clone(),
             });
@@ -597,6 +627,7 @@ mod tests {
                 scale: 2.,
                 ..Default::default()
             },
+            timeline_slot: None,
             range: None,
             source_shift: 0,
         };
@@ -659,6 +690,7 @@ mod tests {
             rig: Default::default(),
             folders: Default::default(),
             library_folder: None,
+            mouth_poses: Default::default(),
             perspective: Default::default(),
         }
     }
@@ -911,7 +943,7 @@ mod tests {
         assert!(e.doc.validate().is_ok());
     }
     #[test]
-    fn timeline_keyboard_copy_paste_keeps_the_canvas_clipboard_behavior() {
+    fn native_timeline_clipboard_events_keep_the_canvas_clipboard_behavior() {
         let mut e = editor();
         e.doc.layers[0].frames[0] = vec![ink([200, 0, 0, 255], 0.)].into();
         e.frame_clipboard.focus = true;
@@ -919,13 +951,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(
             egui::RawInput {
-                events: vec![egui::Event::Key {
-                    key: egui::Key::C,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::COMMAND,
-                }],
+                events: vec![egui::Event::Copy],
                 ..Default::default()
             },
             |ui| {
@@ -938,13 +964,7 @@ mod tests {
         e.frame = 4;
         let mut output = ctx.run_ui(
             egui::RawInput {
-                events: vec![egui::Event::Key {
-                    key: egui::Key::V,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::COMMAND,
-                }],
+                events: vec![egui::Event::Paste("LibreToon frames".into())],
                 ..Default::default()
             },
             |ui| {

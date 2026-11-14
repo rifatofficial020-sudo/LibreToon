@@ -1,0 +1,20 @@
+site_name: LibreToon Manual
+site_url: https://alvillafm.github.io/LibreToon/
+docs_dir: manual
+repo_url: https://github.com/alvillafm/LibreToon
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - search.suggest
+plugins:
+  - search
+nav:
+  - Getting Started: index.md
+  - User Manual:
+      - Drawing and Color: drawing.md
+      - Timeline and Exposure Sheet: timeline.md
+      - Symbols, Clips and Rigging: rigging.md
+      - Cameras, Lights and FX: compositing.md
+  - Tutorials: tutorials.md
+  - Reference: reference.md

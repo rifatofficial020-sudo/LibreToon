@@ -9,6 +9,9 @@ use std::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct SharedVec<T>(Arc<Vec<T>>);
 impl<T> SharedVec<T> {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }

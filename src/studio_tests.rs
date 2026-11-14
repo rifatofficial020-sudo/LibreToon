@@ -24,6 +24,91 @@ fn ink() -> Mark {
 }
 
 #[test]
+fn inspecting_transform_does_not_modify_thin_strokes_on_later_frames() {
+    let mut editor = editor();
+    let ctx = egui::Context::default();
+    editor.frame = 2;
+    let reference = Mark {
+        points: vec![[10., 100.], [10.001, 100.], [10.001, 200.]].into(),
+        ..Mark::default()
+    };
+    let stroke = Mark {
+        points: vec![[100., 100.], [500., 100.], [500., 100.]].into(),
+        ..Mark::default()
+    };
+    for track in [0, 1] {
+        let mut reference = reference.clone();
+        let mut stroke = stroke.clone();
+        reference.style.track = track;
+        stroke.style.track = track;
+        editor.doc.layers[0].frames[0] = vec![reference].into();
+        editor.doc.layers[0].frames[2] = vec![stroke.clone()].into();
+        editor.canvas.selected = vec![(0, 0)];
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.motion_transform_ui(ui)
+        })
+        .textures_delta
+        .clear();
+        assert!(editor.doc.layers[0].frames[2][0] == stroke);
+        assert!(editor.undo.is_empty());
+    }
+}
+
+#[test]
+fn switch_object_folder_uses_the_keyed_child_and_survives_save() {
+    use crate::features::{ObjectFolder, ObjectFolderMode};
+    let mut editor = editor();
+    let layer = &mut editor.doc.layers[0];
+    let mut first = ink();
+    first.style.object_folder = Some([1, 10]);
+    let mut second = ink();
+    second.style.object_folder = Some([1, 11]);
+    second.fill = Some([200, 0, 0, 255]);
+    layer.frames[0] = vec![first, second].into();
+    layer.frames[1] = layer.frames[0].clone();
+    layer.options.object_folders.push(ObjectFolder {
+        id: 1,
+        name: "Mouths".into(),
+        mode: ObjectFolderMode::Switch,
+        choices: vec![(0, 10), (1, 11)].into(),
+    });
+    let restored: crate::Document =
+        serde_json::from_slice(&serde_json::to_vec(&editor.doc).unwrap()).unwrap();
+    for (frame, object) in [(0, 0), (1, 1)] {
+        let marks = crate::features::resolve(&restored, frame, false);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].1, object);
+    }
+}
+
+#[test]
+fn cut_and_paste_vector_and_symbol_to_another_layer() {
+    let mut editor = editor();
+    editor.doc.layers[0].frames[0].push(ink());
+    editor.canvas.selected = vec![(0, 0)];
+    editor.convert_symbol();
+    editor.doc.layers[0].frames[0].push(ink());
+    let mut target = editor.doc.layers[0].clone();
+    for cel in &mut target.frames {
+        cel.clear();
+    }
+    editor.doc.layers.push(target);
+    editor.canvas.selected = vec![(0, 0), (0, 1)];
+    editor.copy_selection(false);
+    editor.layer = 1;
+    editor.paste_selection();
+    assert_eq!(editor.doc.layers[0].frames[0].len(), 2);
+    assert_eq!(editor.doc.layers[1].frames[0].len(), 2);
+    assert!(editor.doc.layers[1].frames[0][0].style.instance.is_some());
+    editor.canvas.selected = vec![(0, 0), (0, 1)];
+    editor.copy_selection(true);
+    editor.layer = 1;
+    editor.paste_selection();
+    assert!(editor.doc.layers[0].frames[0].is_empty());
+    assert_eq!(editor.doc.layers[1].frames[0].len(), 4);
+}
+
+#[test]
 fn document_switch_preserves_art_history_view_and_symbol_context() {
     let mut e = editor();
     e.add_document(crate::fresh_document(), None);
@@ -103,14 +188,23 @@ fn recovered_documents_are_lazy_and_home_stays_selected() {
     e.persist_documents();
     drop(e);
     let ctx = egui::Context::default();
-    let mut restored = Editor::new(&eframe::CreationContext::_new_kittest(ctx));
+    let mut restored = Editor::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
     assert!(restored.hub.home);
     assert!(restored.hub.active.is_none());
     assert_eq!(restored.hub.tabs.len(), 2);
     assert!(restored.doc.layers[0].frames[0].is_empty());
-    restored.activate_document(0);
+    let activate = |editor: &mut Editor, index| {
+        editor.activate_document(index);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while editor.hub.active != Some(index) {
+            assert!(std::time::Instant::now() < deadline, "{}", editor.status);
+            editor.poll_open(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    activate(&mut restored, 0);
     assert_eq!(restored.doc.layers[0].frames[0].len(), 1);
-    restored.activate_document(1);
+    activate(&mut restored, 1);
     assert_eq!(restored.doc.layers[0].name, "Segundo documento");
 }
 
@@ -317,11 +411,11 @@ fn tool_properties_and_reference_canvas_render_without_panics() {
 fn real_pressure_changes_the_saved_width_profile_and_mouse_stays_constant() {
     let mut d = crate::drawing::Drawing::default();
     d.pen.test_pressure(None);
-    d.start(Pos2::ZERO);
+    d.start(Pos2::ZERO, Tool::Brush);
     d.sample(Pos2::new(40., 0.));
     assert!(d.profile(&[]).is_empty());
     d.pen.test_pressure(Some(0.2));
-    d.start(Pos2::ZERO);
+    d.start(Pos2::ZERO, Tool::Brush);
     d.pen.test_pressure(Some(0.8));
     d.sample(Pos2::new(40., 0.));
     // Releasing the pen must not erase pressure collected during the stroke.
@@ -330,6 +424,7 @@ fn real_pressure_changes_the_saved_width_profile_and_mouse_stays_constant() {
     assert!((profile[0].width - 0.2).abs() < 0.001);
     assert!((profile[127].width - 0.8).abs() < 0.001);
     d.pressure = false;
+    d.start(Pos2::ZERO, Tool::Brush);
     assert!(d.profile(&[]).is_empty());
     let mark = Mark {
         points: vec![[0., 0.], [40., 0.]].into(),

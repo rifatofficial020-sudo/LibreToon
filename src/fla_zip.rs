@@ -1,5 +1,5 @@
 //! Minimal ZIP container for modern FLA (XFL). No entries are extracted to disk.
-use std::io::Read;
+use std::io::{Read, Write};
 const LIMIT: usize = 64 * 1024 * 1024;
 fn u16_at(b: &[u8], p: usize) -> Result<u16, String> {
     Ok(u16::from_le_bytes(
@@ -25,30 +25,72 @@ pub fn pack(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
         .collect();
     pack_slices(&entries)
 }
+#[cfg(test)]
 pub fn pack_slices(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut out = vec![];
+    let mut out = Vec::new();
+    write_entries(&mut out, entries, |_| None, None).unwrap();
+    out
+}
+
+pub(crate) fn write_compressed(
+    out: &mut impl std::io::Write,
+    entries: &[(&str, &[u8])],
+    compression: impl Fn(&str) -> flate2::Compression,
+    recovery: Option<&mut RecoveryCompression>,
+) -> std::io::Result<()> {
+    write_entries(out, entries, |name| Some(compression(name)), recovery)
+}
+
+fn write_entries(
+    out: &mut impl std::io::Write,
+    entries: &[(&str, &[u8])],
+    compression: impl Fn(&str) -> Option<flate2::Compression>,
+    mut recovery: Option<&mut RecoveryCompression>,
+) -> std::io::Result<()> {
+    let mut offset = 0u32;
+    let mut header = Vec::new();
     let mut central = vec![];
     for (name, data) in entries {
-        let offset = out.len() as u32;
+        header.clear();
         let crc = crc32fast::hash(data);
         let size = data.len() as u32;
-        push32(&mut out, 0x04034b50);
-        for n in [20, 0x800, 0, 0, 33] {
-            push16(&mut out, n);
+        let compressed = if data.len() >= 256
+            && let Some(level) = compression(name)
+        {
+            if let Some(cache) = recovery.as_deref_mut().filter(|_| {
+                name.starts_with("LIBRETOON/media/") || name.starts_with("LIBRETOON/references/")
+            }) {
+                cache.compress(crc, data, level)?
+            } else {
+                deflate(data, level)?.into()
+            }
+        } else {
+            std::sync::Arc::default()
+        };
+        let (method, payload) = if !compressed.is_empty() && compressed.len() < data.len() {
+            (8, compressed.as_ref())
+        } else {
+            (0, *data)
+        };
+        let packed_size = payload.len() as u32;
+        push32(&mut header, 0x04034b50);
+        for n in [20, 0x800, method, 0, 33] {
+            push16(&mut header, n);
         }
-        push32(&mut out, crc);
-        push32(&mut out, size);
-        push32(&mut out, size);
-        push16(&mut out, name.len() as u16);
-        push16(&mut out, 0);
-        out.extend(name.as_bytes());
-        out.extend_from_slice(data);
+        push32(&mut header, crc);
+        push32(&mut header, packed_size);
+        push32(&mut header, size);
+        push16(&mut header, name.len() as u16);
+        push16(&mut header, 0);
+        header.extend(name.as_bytes());
+        out.write_all(&header)?;
+        out.write_all(payload)?;
         push32(&mut central, 0x02014b50);
-        for n in [20, 20, 0x800, 0, 0, 33] {
+        for n in [20, 20, 0x800, method, 0, 33] {
             push16(&mut central, n);
         }
         push32(&mut central, crc);
-        push32(&mut central, size);
+        push32(&mut central, packed_size);
         push32(&mut central, size);
         push16(&mut central, name.len() as u16);
         for _ in 0..4 {
@@ -57,20 +99,110 @@ pub fn pack_slices(entries: &[(&str, &[u8])]) -> Vec<u8> {
         push32(&mut central, 0);
         push32(&mut central, offset);
         central.extend(name.as_bytes());
+        offset += header.len() as u32 + packed_size;
     }
-    let start = out.len() as u32;
+    let start = offset;
+    header.clear();
     let size = central.len() as u32;
-    out.extend(central);
-    push32(&mut out, 0x06054b50);
-    push16(&mut out, 0);
-    push16(&mut out, 0);
-    push16(&mut out, entries.len() as u16);
-    push16(&mut out, entries.len() as u16);
-    push32(&mut out, size);
-    push32(&mut out, start);
-    push16(&mut out, 0);
-    out
+    out.write_all(&central)?;
+    push32(&mut header, 0x06054b50);
+    push16(&mut header, 0);
+    push16(&mut header, 0);
+    push16(&mut header, entries.len() as u16);
+    push16(&mut header, entries.len() as u16);
+    push32(&mut header, size);
+    push32(&mut header, start);
+    push16(&mut header, 0);
+    out.write_all(&header)
 }
+fn deflate(data: &[u8], level: flate2::Compression) -> std::io::Result<Vec<u8>> {
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+struct RecoveryEntry {
+    crc: u32,
+    level: u32,
+    raw: Vec<u8>,
+    compressed: std::sync::Arc<[u8]>,
+}
+
+#[derive(Default)]
+pub(crate) struct RecoveryCompression {
+    entries: std::collections::VecDeque<RecoveryEntry>,
+    bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+impl RecoveryCompression {
+    fn compress(
+        &mut self,
+        crc: u32,
+        data: &[u8],
+        level: flate2::Compression,
+    ) -> std::io::Result<std::sync::Arc<[u8]>> {
+        const LIMIT: usize = 48 * 1024 * 1024;
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.crc == crc && entry.level == level.level() && entry.raw == data)
+        {
+            let entry = self.entries.remove(index).unwrap();
+            let result = entry.compressed.clone();
+            self.entries.push_back(entry);
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            return Ok(result);
+        }
+        let compressed: std::sync::Arc<[u8]> = deflate(data, level)?.into();
+        let bytes = data.len() + compressed.len();
+        if bytes <= LIMIT {
+            while self.bytes + bytes > LIMIT || self.entries.len() >= 2048 {
+                let expired = self.entries.pop_front().unwrap();
+                self.bytes -= expired.raw.len() + expired.compressed.len();
+            }
+            self.bytes += bytes;
+            self.entries.push_back(RecoveryEntry {
+                crc,
+                level: level.level(),
+                raw: data.to_vec(),
+                compressed: compressed.clone(),
+            });
+        }
+        Ok(compressed)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn recovery_reuses_unchanged_entries_and_writes_a_self_contained_zip() {
+    let mut cache = RecoveryCompression::default();
+    let name = "LIBRETOON/media/1";
+    let original = vec![3u8; 1024];
+    let changed = vec![8u8; 1024];
+    for (index, data) in [&original, &original, &changed].into_iter().enumerate() {
+        let mut archive = Vec::new();
+        write_compressed(
+            &mut archive,
+            &[(name, data.as_slice())],
+            |_| flate2::Compression::default(),
+            Some(&mut cache),
+        )
+        .unwrap();
+        let decoded = Archive::new(&archive)
+            .unwrap()
+            .entry_limited(name.as_bytes(), 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&decoded, data);
+        assert_eq!(cache.hits, usize::from(index > 0));
+    }
+}
+
 pub fn document(bytes: &[u8]) -> Result<String, String> {
     xml_text(entry(bytes, b"DOMDocument.xml")?.ok_or("No se encuentra DOMDocument.xml en el FLA")?)
 }

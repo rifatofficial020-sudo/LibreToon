@@ -18,6 +18,8 @@ pub(crate) fn assemble_project(
         next.extras.animation_clips = child.extras.animation_clips.clone();
         next.extras.animation_library = child.extras.animation_library.clone();
         next.extras.library = child.extras.library.clone();
+        next.extras.palette = child.extras.palette.clone();
+        next.extras.main_palettes = child.extras.main_palettes.clone();
         next.extras.media.assets = child.extras.media.assets.clone();
         next.extras.references = child.extras.references.clone();
         if let Some(s) = next.extras.symbols.iter_mut().find(|s| s.id == *id) {
@@ -43,7 +45,7 @@ impl Editor {
             self.redo.clear();
         }
     }
-    pub fn prepare_style(&self, mut marks: Vec<Mark>) -> Vec<Mark> {
+    pub fn prepare_style(&mut self, mut marks: Vec<Mark>) -> Vec<Mark> {
         let bounds = marks.iter().fold(Rect::NOTHING, |r, m| {
             r.union(crate::vector::control_bounds(m))
         });
@@ -55,6 +57,7 @@ impl Editor {
                 g.fit(bounds);
                 m.style.gradient = Some(g);
             }
+            self.link_drawn_colors(m);
         }
         marks
     }
@@ -86,6 +89,13 @@ impl Editor {
         crate::advanced::assemble_project(&self.doc, &self.feature)
     }
     pub fn convert_symbol(&mut self) {
+        self.convert_symbol_kind(false);
+    }
+
+    pub(crate) fn convert_symbol_kind(&mut self, lip: bool) {
+        if lip && self.enable_lip_symbol_on_selection() {
+            return;
+        }
         if self.canvas.selected.is_empty()
             || self.doc.extras.symbols.len() >= 500
             || self.doc.layers[self.layer].options.locked
@@ -93,6 +103,13 @@ impl Editor {
             return;
         }
         self.finish_pending_pen();
+        let partial = !self.canvas.partial.is_empty();
+        if partial {
+            let mut state = std::mem::take(&mut self.canvas);
+            self.checkpoint();
+            self.materialize_fragments(&mut state);
+            self.canvas = state;
+        }
         let mut ids = self.canvas.selected.clone();
         ids.sort_unstable();
         ids.dedup();
@@ -119,28 +136,40 @@ impl Editor {
             .extras
             .rig
             .snapshot_targets(&selected_tracks, self.frame);
-        let count = 1;
+        let mouth_poses = if lip {
+            crate::lip::default_poses(1)
+        } else {
+            Default::default()
+        };
+        let count = mouth_poses.len().max(1);
         let id = id();
         let number = self.doc.extras.symbols.len() + 1;
-        self.checkpoint();
-        let mut keys = vec![false; count];
-        keys[0] = true;
+        if !partial {
+            self.checkpoint();
+        }
+        let mut frames = vec![Default::default(); count];
+        frames[0] = marks.into();
         let layer = Layer {
             name: "Artwork".into(),
             visible: true,
-            frames: vec![marks.into(); count].into(),
+            frames: frames.into(),
             options: LayerOptions {
-                keys: keys.into(),
+                keys: vec![true; count].into(),
                 ..Default::default()
             },
         };
         self.doc.extras.symbols.push(Symbol {
             rig,
             library_folder: None,
+            mouth_poses,
             folders: Default::default(),
             perspective: Default::default(),
             id,
-            name: format!("Symbol {}", number),
+            name: if lip {
+                format!("{} {number}", tr("Lip Sync symbol"))
+            } else {
+                format!("Symbol {number}")
+            },
             layers: vec![layer].into(),
         });
         let mut sorted = ids;
@@ -160,7 +189,11 @@ impl Editor {
             clock: Default::default(),
             symbol: id,
             matrix: [1., 0., 0., 1., 0., 0.],
-            mode: Playback::Loop,
+            mode: if lip {
+                Playback::Single
+            } else {
+                Playback::Loop
+            },
             first: 0,
             born: self.frame,
         });
@@ -187,6 +220,7 @@ impl Editor {
         self.feature
             .symbol_stack
             .push((self.doc.clone(), self.frame, self.layer, id));
+        self.close_lip_session();
         self.animation.play_all = false;
         self.animation.picker = None;
         self.doc.layers = layers;
@@ -213,6 +247,8 @@ impl Editor {
             parent.extras.animation_clips = self.doc.extras.animation_clips.clone();
             parent.extras.animation_library = self.doc.extras.animation_library.clone();
             parent.extras.library = self.doc.extras.library.clone();
+            parent.extras.palette = self.doc.extras.palette.clone();
+            parent.extras.main_palettes = self.doc.extras.main_palettes.clone();
             parent.extras.media.assets = self.doc.extras.media.assets.clone();
             parent.extras.references = self.doc.extras.references.clone();
             if let Some(s) = parent.extras.symbols.iter_mut().find(|s| s.id == id) {
@@ -316,11 +352,25 @@ impl Editor {
                 .flat_map(|l| l.frames.iter().flatten())
                 .any(|m| m.style.instance.as_ref().is_some_and(|i| i.symbol == id))
         };
-        self.doc
-            .extras
-            .animation_clips
-            .iter()
-            .any(|clip| clip.symbol == id)
+        self.doc.extras.rig.character_symbol == Some(id)
+            || self
+                .doc
+                .extras
+                .scenes
+                .iter()
+                .any(|scene| scene.rig.character_symbol == Some(id))
+            || self
+                .doc
+                .extras
+                .symbols
+                .iter()
+                .any(|symbol| symbol.rig.character_symbol == Some(id))
+            || self
+                .doc
+                .extras
+                .animation_clips
+                .iter()
+                .any(|clip| clip.symbol == id)
             || references(&self.doc.layers)
             || self
                 .doc
@@ -396,6 +446,29 @@ impl Editor {
                 .instance
                 .clone()
             {
+                if self.doc.layers[l].frames[self.frame][m]
+                    .style
+                    .symbol_pivot
+                    .is_some()
+                    && design::button(
+                        ui,
+                        Icon::Undo,
+                        "Reset symbol pivot",
+                        "",
+                        false,
+                        !self.doc.layers[l].options.locked,
+                    )
+                    .clicked()
+                {
+                    let selection = self.canvas.selected.clone();
+                    self.checkpoint();
+                    self.doc.layers[l].frames[self.frame][m].style.symbol_pivot = None;
+                    self.canvas.selected = selection;
+                    self.recover();
+                }
+                if self.lip_instance_properties(ui, l, m, instance.symbol) {
+                    return;
+                }
                 design::category(ui, "SÍMBOLO");
                 let mut settings = instance.clone();
                 egui::ComboBox::from_id_salt("symbol-clock")
@@ -1188,6 +1261,7 @@ mod tests {
             parent: None,
             collapsed: false,
             transform: Default::default(),
+            timeline_slot: None,
             range: None,
             source_shift: 0,
         });
@@ -1319,6 +1393,7 @@ mod tests {
             parent: Some(1),
             collapsed: false,
             transform: Default::default(),
+            timeline_slot: None,
             range: None,
             source_shift: 0,
         });
@@ -1338,6 +1413,7 @@ mod tests {
         e.doc.extras.symbols.push(Symbol {
             rig: Default::default(),
             library_folder: None,
+            mouth_poses: Default::default(),
             folders: Default::default(),
             perspective: Default::default(),
             id: 1,
